@@ -20,6 +20,7 @@ services:
       OFFICE_HOST: 0.0.0.0
       OFFICE_PORT: ${OFFICE_PORT:-3977}
       OFFICE_TOKEN: ${OFFICE_TOKEN:?set OFFICE_TOKEN in .env}
+      OFFICE_VIEW_TOKEN: ${OFFICE_VIEW_TOKEN:-}
       OFFICE_STATE_PATH: /data/office-state.json
       OFFICE_RATE_LIMIT: ${OFFICE_RATE_LIMIT:-240}
     volumes:

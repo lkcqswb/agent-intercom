@@ -17,6 +17,7 @@ import {
   loadConfig,
   saveConfig,
   registerAgent,
+  heartbeat,
   listState,
   sendMessage,
   getInbox,
@@ -28,6 +29,42 @@ import {
 
 const SERVER_INFO = { name: "office-relay", version: "0.2.0" };
 const DEFAULT_PROTOCOL = "2025-06-18";
+
+// Presence: once THIS session registers, keep it "online" in the office with a
+// periodic heartbeat, and remove it when the session/process ends. Only the
+// identity registered in this process is managed, so multiple sessions sharing a
+// config file never clobber each other's presence.
+let mine = null; // { url, token, agent }
+let beatTimer = null;
+function startPresence(url, tokenValue, agent) {
+  mine = { url, token: tokenValue, agent };
+  if (beatTimer) clearInterval(beatTimer);
+  const beat = () =>
+    heartbeat(url, tokenValue, {
+      id: agent.id,
+      name: agent.name,
+      status: "online",
+      role: agent.role,
+      host: agent.host,
+      cwd: agent.cwd,
+      capabilities: agent.capabilities,
+    }).catch(() => {});
+  beat();
+  beatTimer = setInterval(beat, 30000);
+  if (beatTimer.unref) beatTimer.unref();
+}
+let leaving = false;
+async function leaveOffice() {
+  if (leaving) return;
+  leaving = true;
+  if (beatTimer) clearInterval(beatTimer);
+  if (mine) {
+    try {
+      await unregisterAgent(mine.url, mine.token, mine.agent.id);
+    } catch {}
+  }
+  process.exit(0);
+}
 
 function write(message) {
   process.stdout.write(JSON.stringify(message) + "\n");
@@ -152,6 +189,7 @@ async function callTool(name, args = {}) {
           cwd: agent.cwd,
         },
       });
+      startPresence(args.url, args.token, agent); // keep online + auto-leave on exit
       return toolText(
         `Registered "${agent.id}" with hub ${args.url}.\n` + JSON.stringify(result, null, 2)
       );
@@ -287,5 +325,7 @@ process.stdin.on("data", (chunk) => {
     handle(message);
   }
 });
-process.stdin.on("end", () => process.exit(0));
+process.stdin.on("end", leaveOffice);
+process.on("SIGTERM", leaveOffice);
+process.on("SIGINT", leaveOffice);
 process.stderr.write(`office-relay-mcp ${SERVER_INFO.version} ready on stdio\n`);

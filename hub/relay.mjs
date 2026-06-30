@@ -12,6 +12,7 @@ const statePath = process.env.OFFICE_STATE_PATH || path.join(__dirname, "office-
 const port = Number(process.env.OFFICE_PORT || 3977);
 const host = process.env.OFFICE_HOST || "127.0.0.1";
 const token = process.env.OFFICE_TOKEN || "";
+const viewToken = process.env.OFFICE_VIEW_TOKEN || ""; // read-only: office UI / shareable preview
 
 // Tunables (env-overridable)
 const idleMs = Number(process.env.OFFICE_IDLE_MS || 45000);
@@ -33,6 +34,8 @@ Environment:
   OFFICE_PORT        Port to bind. Default: 3977
   OFFICE_TOKEN       Bearer token. REQUIRED when binding a non-loopback host
                      (unless OFFICE_ALLOW_NO_TOKEN=1).
+  OFFICE_VIEW_TOKEN  Optional read-only token for the office UI / shareable
+                     preview link. Can GET /api/feed and /api/state only.
   OFFICE_STATE_PATH  Where to persist state. Default: alongside this file.
   OFFICE_RATE_LIMIT  Max API requests per minute per client IP. Default: 240
   OFFICE_MAX_BODY    Max request body bytes. Default: 65536
@@ -56,6 +59,7 @@ if (!token && !isLoopback && process.env.OFFICE_ALLOW_NO_TOKEN !== "1") {
 }
 
 const tokenHeader = token ? `Bearer ${token}` : "";
+const viewHeader = viewToken ? `Bearer ${viewToken}` : "";
 
 // ---------------------------------------------------------------------------
 // State: single in-memory source of truth. All mutations happen synchronously
@@ -259,12 +263,21 @@ function rateLimited(req) {
   return bucket.count > rateLimit;
 }
 
-function safeTokenMatch(authHeader) {
-  if (!token) return true;
-  const provided = Buffer.from(String(authHeader || ""));
-  const expected = Buffer.from(tokenHeader);
-  if (provided.length !== expected.length) return false;
-  return crypto.timingSafeEqual(provided, expected);
+function safeMatch(provided, expected) {
+  if (!expected) return false;
+  const p = Buffer.from(String(provided || ""));
+  const e = Buffer.from(expected);
+  if (p.length !== e.length) return false;
+  return crypto.timingSafeEqual(p, e);
+}
+
+// "full" = can mutate; "view" = read-only (office UI); "none" = rejected.
+function authLevel(req) {
+  if (!token) return "full"; // no auth configured (local dev)
+  const header = req.headers.authorization || "";
+  if (safeMatch(header, tokenHeader)) return "full";
+  if (viewToken && safeMatch(header, viewHeader)) return "view";
+  return "none";
 }
 
 async function handleApi(req, res, url) {
@@ -275,14 +288,32 @@ async function handleApi(req, res, url) {
 
   if (rateLimited(req)) return json(res, 429, { error: "rate limit exceeded" });
 
-  if (token && !safeTokenMatch(req.headers.authorization)) {
-    return json(res, 401, { error: "unauthorized" });
+  const level = authLevel(req);
+  if (level === "none") return json(res, 401, { error: "unauthorized" });
+  const isReadOnlyPath =
+    req.method === "GET" && (url.pathname === "/api/state" || url.pathname === "/api/feed");
+  if (level === "view" && !isReadOnlyPath) {
+    return json(res, 403, { error: "read-only token" });
   }
 
   if (req.method === "GET" && url.pathname === "/api/state") {
     // Liveness/cleanup, but never expose message bodies here.
     if (reconcile()) persist();
     return json(res, 200, { ok: true, agents: state.agents, events: state.events });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/feed") {
+    // Powers the office UI: presence + recent message stream. Read-only.
+    if (reconcile()) persist();
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 120, 1), 500);
+    return json(res, 200, {
+      ok: true,
+      now: Date.now(),
+      youAre: level,
+      agents: state.agents,
+      messages: state.messages.slice(-limit),
+      events: state.events.slice(-60),
+    });
   }
 
   if (req.method === "POST" && url.pathname === "/api/register") {
@@ -393,117 +424,115 @@ async function handleApi(req, res, url) {
 }
 
 function page() {
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Office Relay</title>
-  <style>
-    :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #111; color: #eee; }
-    body { margin: 0; padding: 24px; }
-    main { max-width: 1080px; margin: 0 auto; }
-    h1 { margin: 0 0 8px; font-size: 24px; }
-    .muted { color: #aaa; font-size: 13px; }
-    .toolbar { display: flex; gap: 8px; margin: 18px 0; align-items: center; }
-    input { border: 1px solid #444; background: #0f172a; color: #fff; padding: 7px 10px; border-radius: 6px; min-width: 240px; }
-    button { border: 1px solid #444; background: #1f2937; color: #fff; padding: 7px 10px; border-radius: 6px; cursor: pointer; }
-    button:hover { background: #374151; }
-    button.danger { border-color: #7f1d1d; background: #450a0a; }
-    table { width: 100%; border-collapse: collapse; background: #181818; border: 1px solid #333; }
-    th, td { border-bottom: 1px solid #2b2b2b; padding: 10px; text-align: left; vertical-align: top; font-size: 14px; }
-    th { color: #bbb; font-weight: 600; background: #202020; }
-    code { color: #d8b4fe; }
-    .empty { padding: 24px; border: 1px solid #333; background: #181818; }
-  </style>
-</head>
-<body>
-<main>
-  <h1>Office Relay</h1>
-  <div class="muted">Registered sessions only. Use pixtuoid for the visual office.</div>
-  <div class="toolbar">
-    <button id="refresh">Refresh</button>
-    <input id="token" type="password" placeholder="Bearer token, if required">
-    <button id="saveToken">Save token</button>
-    <span class="muted" id="status"></span>
-  </div>
-  <div id="app"></div>
-</main>
-<script>
-const app = document.querySelector("#app");
-const statusEl = document.querySelector("#status");
-const tokenInput = document.querySelector("#token");
-tokenInput.value = localStorage.getItem("officeRelayToken") || "";
-document.querySelector("#refresh").addEventListener("click", load);
-document.querySelector("#saveToken").addEventListener("click", () => {
-  localStorage.setItem("officeRelayToken", tokenInput.value.trim());
-  load();
-});
-
-function headers() {
-  const token = localStorage.getItem("officeRelayToken") || "";
-  return token ? { authorization: "Bearer " + token } : {};
-}
-
-function age(ts) {
-  if (!ts) return "";
-  const seconds = Math.max(0, Math.floor((Date.now() - ts) / 1000));
-  if (seconds < 60) return seconds + "s ago";
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return minutes + "m ago";
-  return Math.floor(minutes / 60) + "h ago";
-}
-
-async function clearAgent(id) {
-  if (!confirm("Remove " + id + " from Office Relay?")) return;
-  const res = await fetch("/api/unregister", {
-    method: "POST",
-    headers: { "content-type": "application/json", ...headers() },
-    body: JSON.stringify({ id })
-  });
-  if (!res.ok) alert(await res.text());
-  await load();
-}
-
-async function load() {
-  statusEl.textContent = "Loading...";
-  const res = await fetch("/api/state", { headers: headers() });
-  if (!res.ok) {
-    statusEl.textContent = "Unable to load sessions";
-    app.innerHTML = '<div class="empty">Request failed: ' + escapeHtml(await res.text()) + '</div>';
-    return;
-  }
-  const state = await res.json();
-  const agents = Object.values(state.agents || {}).sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
-  statusEl.textContent = agents.length + " registered session" + (agents.length === 1 ? "" : "s");
-  if (!agents.length) {
-    app.innerHTML = '<div class="empty">No registered sessions.</div>';
-    return;
-  }
-  app.innerHTML = '<table><thead><tr><th>Agent</th><th>Status</th><th>Role</th><th>Host</th><th>Directory</th><th>Last seen</th><th></th></tr></thead><tbody>' +
-    agents.map(agent => '<tr>' +
-      '<td><strong>' + escapeHtml(agent.name || agent.id) + '</strong><br><code>' + escapeHtml(agent.id) + '</code></td>' +
-      '<td>' + escapeHtml(agent.status || "") + '</td>' +
-      '<td>' + escapeHtml(agent.role || "") + '<br><span class="muted">' + escapeHtml((agent.capabilities || []).join(", ")) + '</span></td>' +
-      '<td>' + escapeHtml(agent.host || "") + '</td>' +
-      '<td><code>' + escapeHtml(agent.cwd || "") + '</code></td>' +
-      '<td>' + age(agent.lastSeen) + '</td>' +
-      '<td><button class="danger" data-id="' + escapeHtml(agent.id) + '">Remove</button></td>' +
-    '</tr>').join("") + '</tbody></table>';
-  for (const button of app.querySelectorAll("button[data-id]")) {
-    button.addEventListener("click", () => clearAgent(button.dataset.id));
-  }
-}
-
-function escapeHtml(value) {
-  return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
-}
-
-load();
-setInterval(load, 5000);
-</script>
-</body>
-</html>`;
+  // Self-contained pixel-office UI (original CSS-drawn art, no third-party assets).
+  // Read-only: polls /api/feed for presence + the message stream. Token comes from
+  // the URL (#token=… preferred, ?token=… also accepted) or localStorage.
+  // NOTE: the inline script must avoid backticks and ${ } (it lives in a template literal).
+  return [
+"<!doctype html>",
+"<html lang='en'><head>",
+"<meta charset='utf-8'>",
+"<meta name='viewport' content='width=device-width, initial-scale=1'>",
+"<title>Office Relay</title>",
+"<style>",
+":root{color-scheme:dark;--bg:#0d1018;--panel:#141a26;--line:#243049;--ink:#e7ecf5;--mut:#8a97b0;--accent:#54b6ff}",
+"*{box-sizing:border-box}",
+"body{margin:0;background:var(--bg);color:var(--ink);font-family:ui-monospace,'SFMono-Regular',Menlo,Consolas,monospace;font-size:13px}",
+"#top{display:flex;align-items:center;gap:14px;padding:10px 16px;border-bottom:1px solid var(--line);background:#0a0d14;position:sticky;top:0;z-index:5}",
+".brand{font-weight:700;font-size:16px;letter-spacing:.5px}",
+".brand .sub{color:var(--mut);font-weight:400;font-size:12px;margin-left:6px}",
+".meta{margin-left:auto;display:flex;gap:10px;align-items:center;color:var(--mut)}",
+".badge{border:1px solid var(--line);border-radius:6px;padding:2px 8px;font-size:11px}",
+".badge.full{color:#ffd479;border-color:#5a4a1f}.badge.view{color:#7fd1a8;border-color:#234e3a}",
+".keybox{display:flex;gap:6px}.keybox input{background:#0f1623;border:1px solid var(--line);color:#fff;border-radius:6px;padding:5px 8px;width:200px}",
+".keybox button,.mini{background:#1c2740;border:1px solid var(--line);color:#fff;border-radius:6px;padding:5px 9px;cursor:pointer}",
+"#stage{display:flex;height:calc(100vh - 49px)}",
+"#floor{position:relative;flex:1;overflow:hidden;background:",
+"repeating-linear-gradient(45deg,#11161f 0 14px,#0f141d 14px 28px);",
+"border-right:1px solid var(--line)}",
+"#floor:before{content:'';position:absolute;inset:14px;border:2px dashed #1c2740;border-radius:10px;pointer-events:none}",
+".empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--mut)}",
+".seat{position:absolute;width:120px;margin-left:-60px;text-align:center;transition:left .6s ease,top .6s ease,opacity .4s;cursor:default}",
+".seat.enter{animation:pop .45s ease}",
+".seat.leaving{opacity:0;transform:scale(.7)}",
+"@keyframes pop{0%{opacity:0;transform:translateY(-10px) scale(.6)}100%{opacity:1;transform:none}}",
+".person{position:relative;width:40px;height:46px;margin:0 auto}",
+".person .head{position:absolute;left:11px;top:0;width:18px;height:18px;background:var(--c);border:2px solid #0a0d14;border-radius:6px}",
+".person .head:after{content:'';position:absolute;left:3px;top:7px;width:3px;height:3px;background:#0a0d14;box-shadow:7px 0 0 #0a0d14}",
+".person .body{position:absolute;left:6px;top:17px;width:28px;height:26px;background:var(--c);border:2px solid #0a0d14;border-radius:8px 8px 4px 4px;filter:brightness(.85)}",
+".desk{width:78px;height:12px;margin:2px auto 0;background:#3a2c1e;border:2px solid #0a0d14;border-radius:3px;box-shadow:0 6px 0 -2px #00000055}",
+".idle .person{filter:grayscale(.5) brightness(.7)}",
+".label{margin-top:6px;font-weight:700;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+".role{color:var(--mut);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+".dot{display:inline-block;width:7px;height:7px;border-radius:50%;vertical-align:middle;margin-right:3px}",
+".s-online{background:#41d97f;box-shadow:0 0 6px #41d97f}.s-idle{background:#e6b450}.s-offline{background:#6b7280}",
+".bubble{position:absolute;left:50%;bottom:100%;transform:translateX(-50%);margin-bottom:6px;max-width:170px;background:#fff;color:#111;border-radius:8px;padding:5px 8px;font-size:11px;line-height:1.3;box-shadow:0 4px 14px #0008;opacity:0;transition:opacity .25s;pointer-events:none;white-space:normal;z-index:3}",
+".bubble.show{opacity:1}.bubble:after{content:'';position:absolute;left:50%;top:100%;transform:translateX(-50%);border:6px solid transparent;border-top-color:#fff}",
+".pulse{position:absolute;width:46px;height:46px;margin:-3px 0 0 -3px;border:2px solid var(--accent);border-radius:10px;animation:pr .8s ease-out forwards;pointer-events:none}",
+"@keyframes pr{0%{opacity:.8;transform:scale(.7)}100%{opacity:0;transform:scale(2.2)}}",
+".fly{position:absolute;width:10px;height:10px;border-radius:50%;background:var(--accent);box-shadow:0 0 10px var(--accent);transition:transform 1s cubic-bezier(.4,0,.2,1),opacity 1s;z-index:4;pointer-events:none}",
+"#side{width:340px;display:flex;flex-direction:column;background:var(--panel)}",
+".side-h{padding:10px 14px;border-bottom:1px solid var(--line);font-weight:700}",
+"#feed{flex:1;overflow:auto;padding:8px 10px}",
+".msg{border:1px solid var(--line);border-radius:8px;padding:7px 9px;margin-bottom:7px;background:#0f1623;animation:pop .3s ease}",
+".msg .rt{display:flex;justify-content:space-between;font-size:11px;margin-bottom:3px}",
+".msg .who{font-weight:700}.msg .arrow{color:var(--mut)}.msg .t{color:var(--mut)}",
+".msg .bd{white-space:pre-wrap;word-break:break-word}",
+".msg.broadcast{border-color:#5a4a1f}",
+"</style></head><body>",
+"<div id='top'>",
+"<div class='brand'>&#127970; Office Relay<span class='sub'>live office</span></div>",
+"<div class='meta'><span id='count'>connecting&hellip;</span><span id='mode' class='badge'></span>",
+"<span id='keybox' class='keybox' hidden><input id='key' type='password' placeholder='view token'><button id='save'>enter</button></span>",
+"</div></div>",
+"<div id='stage'>",
+"<div id='floor'><div id='floorEmpty' class='empty'>waiting for the relay&hellip;</div></div>",
+"<aside id='side'><div class='side-h'>&#128172; Activity</div><div id='feed'></div></aside>",
+"</div>",
+"<script>",
+"var qs=new URLSearchParams(location.search);",
+"var hs=new URLSearchParams((location.hash||'').replace(/^#/,''));",
+"var token=qs.get('token')||hs.get('token')||localStorage.getItem('officeRelayToken')||'';",
+"if(token)localStorage.setItem('officeRelayToken',token);",
+"var floor=document.getElementById('floor'),feed=document.getElementById('feed');",
+"var countEl=document.getElementById('count'),modeEl=document.getElementById('mode');",
+"var keybox=document.getElementById('keybox');",
+"document.getElementById('save').onclick=function(){var v=document.getElementById('key').value.trim();if(v){localStorage.setItem('officeRelayToken',v);token=v;keybox.hidden=true;poll();}};",
+"var seats={},seenMsgs=null,canRemove=false;",
+"function esc(s){return String(s==null?'':s).replace(/[&<>\"']/g,function(c){return({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'})[c];});}",
+"function ago(ts){if(!ts)return '';var s=Math.max(0,Math.floor((Date.now()-ts)/1000));if(s<60)return s+'s';var m=Math.floor(s/60);if(m<60)return m+'m';return Math.floor(m/60)+'h';}",
+"function hdr(){return token?{authorization:'Bearer '+token}:{};}",
+"function present(a){return a.status==='online'||a.status==='idle';}",
+"function layout(ids){var n=ids.length;var cols=Math.max(1,Math.min(5,Math.ceil(Math.sqrt(n))));var rows=Math.ceil(n/cols);ids.forEach(function(id,i){var seat=seats[id];if(!seat)return;var r=Math.floor(i/cols),c=i%cols;var cellW=100/cols,cellH=100/Math.max(1,rows);var left=cellW*(c+0.5),top=cellH*(r+0.5);seat.el.style.left=left+'%';seat.el.style.top='calc('+top+'% + 6px)';});}",
+"function makeSeat(a){var el=document.createElement('div');el.className='seat enter';el.innerHTML=",
+"'<div class=\"bubble\"></div>'+",
+"'<div class=\"person\" style=\"--c:'+esc(a.color||'#54b6ff')+'\"><div class=\"head\"></div><div class=\"body\"></div></div>'+",
+"'<div class=\"desk\"></div>'+",
+"'<div class=\"label\"><span class=\"dot\"></span><span class=\"nm\"></span></div>'+",
+"'<div class=\"role\"></div>';",
+"floor.appendChild(el);setTimeout(function(){el.classList.remove('enter');},460);",
+"return {el:el,bubble:el.querySelector('.bubble'),dot:el.querySelector('.dot'),nm:el.querySelector('.nm'),role:el.querySelector('.role')};}",
+"function updateSeat(s,a){s.dot.className='dot s-'+(a.status||'offline');s.nm.textContent=a.name||a.id;var caps=(a.capabilities&&a.capabilities.length)?(' \\u00b7 '+a.capabilities.join(',')):'';s.role.textContent=(a.role||'')+(a.host?(' @'+a.host):'')+caps;s.el.title=a.id+'  '+(a.cwd||'')+'  ('+a.status+', seen '+ago(a.lastSeen)+')';s.el.classList.toggle('idle',a.status==='idle');}",
+"function center(id){var s=seats[id];if(!s)return null;var p=s.el.querySelector('.person');var fr=floor.getBoundingClientRect(),pr=p.getBoundingClientRect();return {x:pr.left-fr.left+pr.width/2,y:pr.top-fr.top+pr.height/2};}",
+"function showBubble(id,text){var s=seats[id];if(!s)return;s.bubble.textContent=text.length>90?text.slice(0,88)+'\\u2026':text;s.bubble.classList.add('show');clearTimeout(s.bt);s.bt=setTimeout(function(){s.bubble.classList.remove('show');},4200);}",
+"function pulse(id){var c=center(id);if(!c)return;var d=document.createElement('div');d.className='pulse';d.style.left=c.x+'px';d.style.top=c.y+'px';floor.appendChild(d);setTimeout(function(){d.remove();},850);}",
+"function fly(from,to){var a=center(from),b=center(to);if(!a||!b)return;var d=document.createElement('div');d.className='fly';d.style.left=a.x+'px';d.style.top=a.y+'px';floor.appendChild(d);requestAnimationFrame(function(){d.style.transform='translate('+(b.x-a.x)+'px,'+(b.y-a.y)+'px)';setTimeout(function(){d.style.opacity='0';},650);});setTimeout(function(){d.remove();},1100);}",
+"function animateMsg(m){showBubble(m.from,m.body);if(m.to==='all'){pulse(m.from);Object.keys(seats).forEach(function(id){if(id!==m.from)fly(m.from,id);});}else{fly(m.from,m.to);}}",
+"function addMsg(m,animate){if(seenMsgs[m.id])return;seenMsgs[m.id]=1;var div=document.createElement('div');div.className='msg'+(m.to==='all'?' broadcast':'');div.innerHTML='<div class=\"rt\"><span><span class=\"who\">'+esc(m.from)+'</span> <span class=\"arrow\">&rarr;</span> <span class=\"who\">'+esc(m.to)+'</span></span><span class=\"t\" data-ts=\"'+(m.createdAt||0)+'\">'+ago(m.createdAt)+'</span></div><div class=\"bd\">'+esc(m.body)+'</div>';feed.insertBefore(div,feed.firstChild);while(feed.children.length>80)feed.removeChild(feed.lastChild);if(animate)animateMsg(m);}",
+"function refreshTimes(){var ts=feed.querySelectorAll('.t');for(var i=0;i<ts.length;i++){ts[i].textContent=ago(Number(ts[i].getAttribute('data-ts')));}}",
+"function render(data){canRemove=(data.youAre==='full');modeEl.textContent=canRemove?'admin':'read-only';modeEl.className='badge '+(canRemove?'full':'view');",
+"var agents=data.agents||{};var ids=Object.keys(agents).filter(function(id){return present(agents[id]);});",
+"ids.sort(function(a,b){return (agents[a].registeredAt||0)-(agents[b].registeredAt||0)||a.localeCompare(b);});",
+"Object.keys(seats).forEach(function(id){if(ids.indexOf(id)<0){var s=seats[id];s.el.classList.add('leaving');setTimeout(function(){if(s.el.parentNode)s.el.remove();},420);delete seats[id];}});",
+"ids.forEach(function(id){if(!seats[id])seats[id]=makeSeat(agents[id]);updateSeat(seats[id],agents[id]);});",
+"layout(ids);",
+"var fe=document.getElementById('floorEmpty');fe.textContent='Office is empty - no sessions connected yet';fe.style.display=ids.length?'none':'flex';",
+"countEl.textContent=ids.length+' in office'+(ids.length?(' \\u00b7 '+ids.filter(function(id){return agents[id].status==='online';}).length+' active'):'');",
+"var msgs=data.messages||[];var firstLoad=(seenMsgs===null);if(firstLoad)seenMsgs={};msgs.forEach(function(m){addMsg(m,!firstLoad);});refreshTimes();}",
+"function poll(){fetch('/api/feed?limit=120',{headers:hdr()}).then(function(r){if(r.status===401){countEl.textContent='token required';keybox.hidden=false;throw 0;}if(!r.ok)throw 0;return r.json();}).then(render).catch(function(){});}",
+"poll();setInterval(poll,1500);",
+"<\/script></body></html>"
+  ].join("\n");
 }
 
 const server = http.createServer(async (req, res) => {
@@ -541,6 +570,6 @@ reconcileTimer.unref();
 await initState();
 server.listen(port, host, () => {
   console.log(
-    `Claude Office Relay running at http://${host}:${port}  (auth: ${token ? "on" : "OFF"})`
+    `Claude Office Relay running at http://${host}:${port}  (auth: ${token ? "on" : "OFF"}, view-token: ${viewToken ? "on" : "off"})`
   );
 });

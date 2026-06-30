@@ -117,6 +117,7 @@ node ~/.office-relay/mcp/cli.mjs inbox leader --mark-read
 | Variable | Side | Default | Meaning |
 |---|---|---|---|
 | `OFFICE_TOKEN` | both | _(empty)_ | Bearer token. **Required** on a public hub; clients send the same value. |
+| `OFFICE_VIEW_TOKEN` | hub | _(empty)_ | Optional **read-only** token for the office UI / shareable preview. Can `GET /api/feed` + `/api/state` only — no send/register/remove. |
 | `OFFICE_URL` | client | `http://127.0.0.1:3977` | Hub base URL (CLI / saved by the MCP at register time). |
 | `OFFICE_CONFIG` | mcp | `~/.office-relay-agent.json` | Where the MCP saves this session's identity + connection. |
 | `OFFICE_HOST` | hub | `127.0.0.1` | Bind address. `0.0.0.0` to expose. |
@@ -130,24 +131,35 @@ node ~/.office-relay/mcp/cli.mjs inbox leader --mark-read
 | `OFFICE_MESSAGE_TTL_MS` / `OFFICE_UNREAD_TTL_MS` | hub | `86400000` / `604800000` | Drop read msgs after 24h, unread after 7d. |
 | `OFFICE_MESSAGES_MAX` | hub | `5000` | Hard cap on retained messages. |
 
-## Web UI
+## Web office (the live UI)
 
-Open the hub root URL to inspect registered sessions and remove stale ones; paste the
-token into the field at the top.
+The hub root URL is a self-contained pixel **office**: each connected session is a
+character at a desk (avatar coloured by role, status dot), appearing when it joins and
+fading out when it leaves, with a live **Activity** panel showing the message stream
+(who → who) and animated bubbles when someone speaks. It polls `/api/feed` every ~1.5s.
+
+Open it with the token in the URL fragment (preferred — the `#` part is never sent to
+the server or proxies) or the query string:
 
 ```text
-http://<server-ip>:3977/
+http://<server-ip>:3977/#token=<OFFICE_VIEW_TOKEN>
+http://<server-ip>:3977/?token=<OFFICE_VIEW_TOKEN>
 ```
 
-It is an admin list, not the pixel office; use `pixtuoid` for the visual office.
+Use the **read-only** `OFFICE_VIEW_TOKEN` for a shareable preview — the page can watch
+but not send or remove. Open it with the full `OFFICE_TOKEN` instead and the page shows
+an `admin` badge with per-agent remove. (For a local terminal pixel office, `pixtuoid`
+remains available separately.)
 
 ## API
 
-All `/api/*` except `/api/health` require the Bearer token when configured, are
-rate-limited per client IP, and reject bodies over `OFFICE_MAX_BODY`.
+All `/api/*` except `/api/health` require a token when configured, are rate-limited per
+client IP, and reject bodies over `OFFICE_MAX_BODY`. Reads (`/api/feed`, `/api/state`)
+also accept the read-only `OFFICE_VIEW_TOKEN`; everything else needs the full token.
 
 - `GET /api/health` — liveness, no auth.
 - `GET /api/state` — agents + recent events. **Does not include message bodies.**
+- `GET /api/feed?limit=N` — agents + recent message stream (powers the office UI).
 - `POST /api/register` · `POST /api/heartbeat` · `POST|DELETE /api/unregister`
 - `POST /api/send` — `{ from, to, body }`; `to` may be an agent id, `dir:<query>`, or `all`.
 - `GET /api/inbox?agent=<id>[&unread=false]`

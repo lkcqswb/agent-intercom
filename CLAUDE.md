@@ -1,6 +1,17 @@
 # Office Relay
 
+This repo has two roles. As a Claude session you only act as the **client**
+(`office/office.mjs`): you register, send, and read your inbox against a shared
+**hub** (`office/relay.mjs`) that someone already runs elsewhere. Never start a hub
+on a user's machine unless they explicitly ask you to.
+
 When the user says "use office relay to register yourself", register this Claude Code session with the office relay.
+
+Before registering, make sure the hub is configured in the environment:
+
+- `OFFICE_URL` — the hub base URL (e.g. `http://211.159.223.182:3977`).
+- `OFFICE_TOKEN` — the shared bearer token. If unset, ask the user for it; do not
+  invent one and do not commit it anywhere.
 
 Follow this workflow:
 

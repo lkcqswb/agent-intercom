@@ -1,0 +1,33 @@
+# Office Relay — public deployment (e.g. on the tx server).
+#
+# host networking is used so the relay sees real client IPs (per-IP rate
+# limiting works) and binds the host port directly. This is Linux-only;
+# on macOS/Windows Docker Desktop, comment out network_mode and uncomment
+# the ports: block below.
+#
+# Set OFFICE_TOKEN in a .env file next to this compose file:
+#   OFFICE_TOKEN=<long-random-secret>
+# Then:  docker compose up -d
+services:
+  office-relay:
+    build: .
+    image: office-relay:latest
+    container_name: office-relay
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      OFFICE_HOST: 0.0.0.0
+      OFFICE_PORT: ${OFFICE_PORT:-3977}
+      OFFICE_TOKEN: ${OFFICE_TOKEN:?set OFFICE_TOKEN in .env}
+      OFFICE_STATE_PATH: /data/office-state.json
+      OFFICE_RATE_LIMIT: ${OFFICE_RATE_LIMIT:-240}
+    volumes:
+      - office-data:/data
+    # --- Bridge-network alternative (non-Linux / when host net is undesired) ---
+    # Comment out `network_mode: host` above and uncomment:
+    # ports:
+    #   - "${OFFICE_PORT:-3977}:3977"
+    # environment also needs: OFFICE_TRUST_PROXY may be set if behind a proxy.
+
+volumes:
+  office-data:

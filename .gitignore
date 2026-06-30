@@ -1,0 +1,4 @@
+node_modules/
+.agent-relay/
+office/office-state.json
+office/*.log

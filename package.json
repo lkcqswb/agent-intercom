@@ -1,0 +1,23 @@
+{
+  "name": "office-relay",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Minimal explicit session registry and inbox relay for Claude Code agents.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "office": "node office/relay.mjs",
+    "office:cli": "node office/office.mjs",
+    "pix": "pixtuoid",
+    "pix:setup": "pixtuoid setup",
+    "pix:doctor": "pixtuoid doctor"
+  },
+  "bin": {
+    "office-relay": "office/relay.mjs",
+    "office-relay-cli": "office/office.mjs"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "pixtuoid": "^0.11.1"
+  }
+}

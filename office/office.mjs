@@ -47,6 +47,7 @@ function usage() {
   node office/office.mjs register --help
   node office/office.mjs register-template [agent-id] [display-name]
   node office/office.mjs register <agent-id> [display-name]
+  node office/office.mjs unregister <agent-id>
   node office/office.mjs heartbeat <agent-id> [status]
   node office/office.mjs sessions
   node office/office.mjs send <from> <to> <message...>
@@ -61,6 +62,7 @@ Examples:
   node office/office.mjs register --help
   node office/office.mjs register-template mac-tex-1 "Mac TeX"
   node office/office.mjs register claude-a "Claude A" --role coordinator --host win --capabilities planning,coding
+  node office/office.mjs unregister claude-a
   node office/office.mjs sessions
   node office/office.mjs send claude-a claude-b "hello from A"
   node office/office.mjs send-dir claude-a "project-name" "hello to whoever is in that folder"
@@ -181,6 +183,14 @@ try {
       }),
     });
     console.log(JSON.stringify(agent, null, 2));
+  } else if (cmd === "unregister" || cmd === "remove") {
+    const [id] = args;
+    if (!id) throw new Error("agent-id is required");
+    const result = await api("/api/unregister", {
+      method: "POST",
+      body: JSON.stringify({ id }),
+    });
+    console.log(`removed ${result.id}${result.existed ? "" : " (was not registered)"}`);
   } else if (cmd === "heartbeat") {
     const [id, status = "online"] = args;
     if (!id) throw new Error("agent-id is required");

@@ -69,6 +69,12 @@ node office/office.mjs heartbeat claude-a online
 
 `sessions` shows registered agents, host, role, capabilities, and current working directory.
 
+Open the relay root URL to remove stale registered sessions:
+
+```text
+http://127.0.0.1:3977/
+```
+
 Directory targeting prefers another registered session in that directory over the sender:
 
 ```powershell

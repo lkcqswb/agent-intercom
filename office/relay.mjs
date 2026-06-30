@@ -52,10 +52,15 @@ function json(res, status, value) {
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": "content-type",
+    "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
+    "access-control-allow-headers": "content-type, authorization",
   });
   res.end(JSON.stringify(value));
+}
+
+function html(res, value) {
+  res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+  res.end(value);
 }
 
 async function body(req) {
@@ -181,6 +186,18 @@ async function handleApi(req, res, url) {
     return json(res, 200, state.agents[data.id]);
   }
 
+  if ((req.method === "POST" || req.method === "DELETE") && url.pathname === "/api/unregister") {
+    const data = req.method === "DELETE"
+      ? { id: url.searchParams.get("id") }
+      : await body(req);
+    if (!data.id) return json(res, 400, { error: "id is required" });
+    const existed = Boolean(state.agents[data.id]);
+    delete state.agents[data.id];
+    addEvent(state, "unregister", { agent: data.id, existed });
+    await saveState(state);
+    return json(res, 200, { ok: true, id: data.id, existed });
+  }
+
   if (req.method === "POST" && url.pathname === "/api/send") {
     const data = await body(req);
     if (!data.from || !data.to || !data.body) {
@@ -234,16 +251,127 @@ async function handleApi(req, res, url) {
   return json(res, 404, { error: "not found" });
 }
 
+function page() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Office Relay</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #111; color: #eee; }
+    body { margin: 0; padding: 24px; }
+    main { max-width: 1080px; margin: 0 auto; }
+    h1 { margin: 0 0 8px; font-size: 24px; }
+    .muted { color: #aaa; font-size: 13px; }
+    .toolbar { display: flex; gap: 8px; margin: 18px 0; align-items: center; }
+    input { border: 1px solid #444; background: #0f172a; color: #fff; padding: 7px 10px; border-radius: 6px; min-width: 240px; }
+    button { border: 1px solid #444; background: #1f2937; color: #fff; padding: 7px 10px; border-radius: 6px; cursor: pointer; }
+    button:hover { background: #374151; }
+    button.danger { border-color: #7f1d1d; background: #450a0a; }
+    table { width: 100%; border-collapse: collapse; background: #181818; border: 1px solid #333; }
+    th, td { border-bottom: 1px solid #2b2b2b; padding: 10px; text-align: left; vertical-align: top; font-size: 14px; }
+    th { color: #bbb; font-weight: 600; background: #202020; }
+    code { color: #d8b4fe; }
+    .empty { padding: 24px; border: 1px solid #333; background: #181818; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Office Relay</h1>
+  <div class="muted">Registered sessions only. Use pixtuoid for the visual office.</div>
+  <div class="toolbar">
+    <button id="refresh">Refresh</button>
+    <input id="token" type="password" placeholder="Bearer token, if required">
+    <button id="saveToken">Save token</button>
+    <span class="muted" id="status"></span>
+  </div>
+  <div id="app"></div>
+</main>
+<script>
+const app = document.querySelector("#app");
+const statusEl = document.querySelector("#status");
+const tokenInput = document.querySelector("#token");
+tokenInput.value = localStorage.getItem("officeRelayToken") || "";
+document.querySelector("#refresh").addEventListener("click", load);
+document.querySelector("#saveToken").addEventListener("click", () => {
+  localStorage.setItem("officeRelayToken", tokenInput.value.trim());
+  load();
+});
+
+function headers() {
+  const token = localStorage.getItem("officeRelayToken") || "";
+  return token ? { authorization: "Bearer " + token } : {};
+}
+
+function age(ts) {
+  if (!ts) return "";
+  const seconds = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (seconds < 60) return seconds + "s ago";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return minutes + "m ago";
+  return Math.floor(minutes / 60) + "h ago";
+}
+
+async function clearAgent(id) {
+  if (!confirm("Remove " + id + " from Office Relay?")) return;
+  const res = await fetch("/api/unregister", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers() },
+    body: JSON.stringify({ id })
+  });
+  if (!res.ok) alert(await res.text());
+  await load();
+}
+
+async function load() {
+  statusEl.textContent = "Loading...";
+  const res = await fetch("/api/state", { headers: headers() });
+  if (!res.ok) {
+    statusEl.textContent = "Unable to load sessions";
+    app.innerHTML = '<div class="empty">Request failed: ' + escapeHtml(await res.text()) + '</div>';
+    return;
+  }
+  const state = await res.json();
+  const agents = Object.values(state.agents || {}).sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+  statusEl.textContent = agents.length + " registered session" + (agents.length === 1 ? "" : "s");
+  if (!agents.length) {
+    app.innerHTML = '<div class="empty">No registered sessions.</div>';
+    return;
+  }
+  app.innerHTML = '<table><thead><tr><th>Agent</th><th>Status</th><th>Role</th><th>Host</th><th>Directory</th><th>Last seen</th><th></th></tr></thead><tbody>' +
+    agents.map(agent => '<tr>' +
+      '<td><strong>' + escapeHtml(agent.name || agent.id) + '</strong><br><code>' + escapeHtml(agent.id) + '</code></td>' +
+      '<td>' + escapeHtml(agent.status || "") + '</td>' +
+      '<td>' + escapeHtml(agent.role || "") + '<br><span class="muted">' + escapeHtml((agent.capabilities || []).join(", ")) + '</span></td>' +
+      '<td>' + escapeHtml(agent.host || "") + '</td>' +
+      '<td><code>' + escapeHtml(agent.cwd || "") + '</code></td>' +
+      '<td>' + age(agent.lastSeen) + '</td>' +
+      '<td><button class="danger" data-id="' + escapeHtml(agent.id) + '">Remove</button></td>' +
+    '</tr>').join("") + '</tbody></table>';
+  for (const button of app.querySelectorAll("button[data-id]")) {
+    button.addEventListener("click", () => clearAgent(button.dataset.id));
+  }
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+}
+
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>`;
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (req.method === "OPTIONS") return json(res, 204, {});
   try {
     if (url.pathname.startsWith("/api/")) return await handleApi(req, res, url);
-    return json(res, 200, {
-      name: "claude-office-relay",
-      ok: true,
-      api: ["/api/health", "/api/state", "/api/register", "/api/send", "/api/inbox"],
-    });
+    if (url.pathname === "/") return html(res, page());
+    return json(res, 404, { error: "not found" });
   } catch (error) {
     return json(res, 500, { error: error.message });
   }

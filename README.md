@@ -104,6 +104,16 @@ Read inbox:
 node office/office.mjs inbox leader --mark-read
 ```
 
+## Web UI
+
+Open the relay root URL to inspect registered sessions and remove stale entries:
+
+```text
+http://127.0.0.1:3977/
+```
+
+The web UI is intentionally an admin list, not the pixel office. Use `pixtuoid` for the visual office.
+
 ## pixtuoid
 
 Dry run:

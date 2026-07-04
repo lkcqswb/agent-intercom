@@ -27,7 +27,7 @@ const trustProxy = process.env.OFFICE_TRUST_PROXY === "1";
 
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
   console.log(`Usage:
-  office-relay
+  agent-intercom
 
 Environment:
   OFFICE_HOST        Host to bind. Default: 127.0.0.1
@@ -52,7 +52,7 @@ const loopbackHosts = new Set(["127.0.0.1", "localhost", "::1", "::ffff:127.0.0.
 const isLoopback = loopbackHosts.has(host);
 if (!token && !isLoopback && process.env.OFFICE_ALLOW_NO_TOKEN !== "1") {
   console.error(
-    `office-relay: refusing to bind public host "${host}" without a token.\n` +
+    `agent-intercom: refusing to bind public host "${host}" without a token.\n` +
       `Set OFFICE_TOKEN=<secret> (recommended) or OFFICE_ALLOW_NO_TOKEN=1 to override.`
   );
   process.exit(1);
@@ -75,7 +75,7 @@ async function initState() {
   try {
     state = { ...structuredClone(defaultState), ...JSON.parse(await readFile(statePath, "utf8")) };
   } catch {
-    console.error(`office-relay: could not parse ${statePath}, starting fresh`);
+    console.error(`agent-intercom: could not parse ${statePath}, starting fresh`);
   }
 }
 
@@ -92,7 +92,7 @@ async function flush() {
       await rename(tmp, statePath); // atomic on same filesystem
     }
   } catch (error) {
-    console.error("office-relay: persist failed:", error.message);
+    console.error("agent-intercom: persist failed:", error.message);
   } finally {
     writing = false;
   }
@@ -283,7 +283,7 @@ function authLevel(req) {
 async function handleApi(req, res, url) {
   // Health is intentionally unauthenticated so containers/clients can probe it.
   if (req.method === "GET" && url.pathname === "/api/health") {
-    return json(res, 200, { ok: true, mode: "office-relay", auth: Boolean(token) });
+    return json(res, 200, { ok: true, mode: "agent-intercom", auth: Boolean(token) });
   }
 
   if (rateLimited(req)) return json(res, 429, { error: "rate limit exceeded" });
@@ -433,7 +433,7 @@ function page() {
 "<html lang='en'><head>",
 "<meta charset='utf-8'>",
 "<meta name='viewport' content='width=device-width, initial-scale=1'>",
-"<title>Office Relay</title>",
+"<title>Agent Intercom</title>",
 "<style>",
 ":root{color-scheme:dark;--bg:#0d1018;--panel:#141a26;--line:#243049;--ink:#e7ecf5;--mut:#8a97b0;--accent:#54b6ff}",
 "*{box-sizing:border-box}",
@@ -481,7 +481,7 @@ function page() {
 ".msg.broadcast{border-color:#5a4a1f}",
 "</style></head><body>",
 "<div id='top'>",
-"<div class='brand'>&#127970; Office Relay<span class='sub'>live office</span></div>",
+"<div class='brand'>&#127970; Agent Intercom<span class='sub'>live office</span></div>",
 "<div class='meta'><span id='count'>connecting&hellip;</span><span id='mode' class='badge'></span>",
 "<span id='keybox' class='keybox' hidden><input id='key' type='password' placeholder='view token'><button id='save'>enter</button></span>",
 "</div></div>",
@@ -549,7 +549,7 @@ const server = http.createServer(async (req, res) => {
 
 server.on("error", (error) => {
   if (error.code === "EADDRINUSE") {
-    console.error(`office-relay: ${host}:${port} is already in use`);
+    console.error(`agent-intercom: ${host}:${port} is already in use`);
     process.exit(1);
   }
   throw error;
@@ -570,6 +570,6 @@ reconcileTimer.unref();
 await initState();
 server.listen(port, host, () => {
   console.log(
-    `Claude Office Relay running at http://${host}:${port}  (auth: ${token ? "on" : "OFF"}, view-token: ${viewToken ? "on" : "off"})`
+    `Agent Intercom running at http://${host}:${port}  (auth: ${token ? "on" : "OFF"}, view-token: ${viewToken ? "on" : "off"})`
   );
 });

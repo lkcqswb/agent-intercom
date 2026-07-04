@@ -1,4 +1,4 @@
-// Shared client for the Office Relay hub: HTTP calls + local identity config.
+// Shared client for the Agent Intercom hub: HTTP calls + local identity config.
 // Used by both the MCP server (mcp/server.mjs) and the optional CLI (mcp/cli.mjs).
 
 import { readFile, writeFile } from "node:fs/promises";
@@ -8,7 +8,7 @@ import path from "node:path";
 
 // Config persists the hub connection (url, token) and this session's identity so
 // the user enters them once at register time and later sends/inbox reuse them.
-// Kept OUTSIDE the repo dir (which may itself be ~/.office-relay) to avoid clashes.
+// Kept OUTSIDE the repo dir (which may itself be ~/.agent-intercom) to avoid clashes.
 export const configPath = process.env.OFFICE_CONFIG || path.join(os.homedir(), ".office-relay-agent.json");
 
 export async function loadConfig() {

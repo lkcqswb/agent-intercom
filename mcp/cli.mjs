@@ -75,7 +75,7 @@ Examples:
 
 async function onboard() {
   const health = await api("/api/health");
-  console.log(`Office Relay Onboarding
+  console.log(`Agent Intercom Onboarding
 
 Relay:
   ${baseUrl}
@@ -103,7 +103,7 @@ After registering:
 }
 
 function registerHelp() {
-  console.log(`Register this Claude session with the office relay.
+  console.log(`Register this Claude session with the Agent Intercom hub.
 
 Agent-facing behavior:
   If the user says "register yourself" but does not provide identity details,

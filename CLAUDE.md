@@ -1,14 +1,14 @@
-# Office Relay
+# Agent Intercom
 
 This repo has two halves: a **hub** (`hub/`, the shared server) and an **MCP server**
 (`mcp/`) that each Claude session uses as a client. As a session you only ever act as
 the client — never start a hub on the user's machine unless they explicitly ask.
 
-Registration and messaging go through the **`office-relay` MCP tools**
+Registration and messaging go through the **`agent-intercom` MCP tools**
 (`office_register`, `office_status`, `office_sessions`, `office_send`, `office_inbox`,
 `office_unregister`). Prefer these over the CLI.
 
-## When the user says "register me to office relay"
+## When the user says "register me to agent intercom"
 
 1. Call `office_status` first. If it shows this session is already registered, summarize
    it and stop unless the user wants to change something.

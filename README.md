@@ -1,4 +1,4 @@
-# Office Relay
+# Agent Intercom
 
 A tiny system that lets long-running Claude Code sessions — across machines — see each
 other and exchange messages, only when you explicitly tell them to.
@@ -26,8 +26,8 @@ Run this on a server every session can reach.
 ### Docker (recommended)
 
 ```bash
-git clone https://github.com/lkcqswb/office-relay.git
-cd office-relay/hub
+git clone https://github.com/lkcqswb/agent-intercom.git
+cd agent-intercom/hub
 printf 'OFFICE_TOKEN=%s\nOFFICE_PORT=3977\n' "$(openssl rand -hex 24)" > .env   # generate a strong token
 docker compose up -d --build
 docker compose logs -f          # expect: "running at http://0.0.0.0:3977 (auth: on)"
@@ -66,15 +66,15 @@ OFFICE_TOKEN = <the token in hub/.env>
 Register the MCP server globally so every Claude Code session on this machine has it:
 
 ```bash
-git clone https://github.com/lkcqswb/office-relay.git ~/.office-relay   # if not already
-claude mcp add office-relay --scope user -- node ~/.office-relay/mcp/server.mjs
-claude mcp list      # office-relay → ✔ Connected
+git clone https://github.com/lkcqswb/agent-intercom.git ~/.agent-intercom   # if not already
+claude mcp add agent-intercom --scope user -- node ~/.agent-intercom/mcp/server.mjs
+claude mcp list      # agent-intercom → ✔ Connected
 ```
 
 Then, in **any** session, just say:
 
 ```text
-Register me to office relay.
+Register me to agent intercom.
 ```
 
 The agent will ask you for the machine label, this session's role/duty, and the hub's
@@ -104,10 +104,10 @@ Any messages for me?                  → office_inbox
 
 ```bash
 export OFFICE_URL='http://<server-ip>:3977' OFFICE_TOKEN='<token>'
-node ~/.office-relay/mcp/cli.mjs register linux-baseline-1 "Linux Baseline" --role baseline --host linux-gpu --capabilities gpu,logs
-node ~/.office-relay/mcp/cli.mjs sessions
-node ~/.office-relay/mcp/cli.mjs send leader linux-baseline-1 "Run baseline A."
-node ~/.office-relay/mcp/cli.mjs inbox leader --mark-read
+node ~/.agent-intercom/mcp/cli.mjs register linux-baseline-1 "Linux Baseline" --role baseline --host linux-gpu --capabilities gpu,logs
+node ~/.agent-intercom/mcp/cli.mjs sessions
+node ~/.agent-intercom/mcp/cli.mjs send leader linux-baseline-1 "Run baseline A."
+node ~/.agent-intercom/mcp/cli.mjs inbox leader --mark-read
 ```
 
 ---

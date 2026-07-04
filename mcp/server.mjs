@@ -1,13 +1,13 @@
 #!/usr/bin/env node
-// Office Relay MCP server (Part 2).
+// Agent Intercom MCP server (Part 2).
 //
 // A zero-dependency, stdio JSON-RPC MCP server that lets any Claude Code session
-// register itself with the Office Relay hub and exchange messages. Register it once,
+// register itself with the Agent Intercom hub and exchange messages. Register it once,
 // globally, with:
 //
-//   claude mcp add office-relay --scope user -- node /ABS/PATH/office-relay/mcp/server.mjs
+//   claude mcp add agent-intercom --scope user -- node /ABS/PATH/agent-intercom/mcp/server.mjs
 //
-// Then in any session: "register me to office relay" — the agent collects machine
+// Then in any session: "register me to agent intercom" — the agent collects machine
 // info, role, hub URL and token from the user, calls office_register, and is in.
 //
 // Protocol: MCP over stdio = newline-delimited JSON-RPC 2.0 messages. Nothing except
@@ -28,7 +28,7 @@ import {
   defaultHost,
 } from "./client.mjs";
 
-const SERVER_INFO = { name: "office-relay", version: "0.2.0" };
+const SERVER_INFO = { name: "agent-intercom", version: "0.2.0" };
 const DEFAULT_PROTOCOL = "2025-06-18";
 const CLI_PATH = fileURLToPath(new URL("./cli.mjs", import.meta.url));
 
@@ -85,7 +85,7 @@ const TOOLS = [
   {
     name: "office_register",
     description:
-      "Register THIS Claude Code session into the Office Relay hub so other sessions can see and message it. " +
+      "Register THIS Claude Code session into the Agent Intercom hub so other sessions can see and message it. " +
       "BEFORE calling, ask the user for and confirm: (1) host = a label for this machine (e.g. macbook, linux-gpu); " +
       "(2) role = this session's duty/positioning (e.g. leader, baseline, tex, reviewer); " +
       "(3) url = the hub address as http://IP:PORT; (4) token = the hub's shared token. " +
@@ -111,13 +111,13 @@ const TOOLS = [
   {
     name: "office_status",
     description:
-      "Show this session's saved Office Relay identity and connection (token masked), and ping the hub. " +
+      "Show this session's saved Agent Intercom identity and connection (token masked), and ping the hub. " +
       "Use to check whether this session is already registered before registering again.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "office_sessions",
-    description: "List all sessions currently registered with the Office Relay hub.",
+    description: "List all sessions currently registered with the Agent Intercom hub.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -312,7 +312,7 @@ async function handle(message) {
       if (method === "tools/call") return reply(id, toolText(`office: ${error.message}`, true));
       return replyError(id, -32603, error.message);
     }
-    process.stderr.write(`office-relay-mcp: ${error.stack || error.message}\n`);
+    process.stderr.write(`agent-intercom-mcp: ${error.stack || error.message}\n`);
   }
 }
 
@@ -329,7 +329,7 @@ process.stdin.on("data", (chunk) => {
     try {
       message = JSON.parse(line);
     } catch {
-      process.stderr.write(`office-relay-mcp: bad JSON: ${line}\n`);
+      process.stderr.write(`agent-intercom-mcp: bad JSON: ${line}\n`);
       continue;
     }
     handle(message);
@@ -338,4 +338,4 @@ process.stdin.on("data", (chunk) => {
 process.stdin.on("end", leaveOffice);
 process.on("SIGTERM", leaveOffice);
 process.on("SIGINT", leaveOffice);
-process.stderr.write(`office-relay-mcp ${SERVER_INFO.version} ready on stdio\n`);
+process.stderr.write(`agent-intercom-mcp ${SERVER_INFO.version} ready on stdio\n`);

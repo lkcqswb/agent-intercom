@@ -1,4 +1,4 @@
-# Office Relay — MCP (Part 2)
+# Agent Intercom — MCP (Part 2)
 
 The client half. A zero-dependency stdio MCP server (`server.mjs`) that any Claude Code
 session uses to join the [hub](../hub/) and exchange messages, plus a shared client
@@ -7,15 +7,15 @@ session uses to join the [hub](../hub/) and exchange messages, plus a shared cli
 ## Register globally (once per machine)
 
 ```bash
-claude mcp add office-relay --scope user -- node ~/.office-relay/mcp/server.mjs
-claude mcp list      # office-relay → ✔ Connected
+claude mcp add agent-intercom --scope user -- node ~/.agent-intercom/mcp/server.mjs
+claude mcp list      # agent-intercom → ✔ Connected
 ```
 
 `--scope user` makes it available in every project/session for this user.
 
 ## Use it
 
-In any session: **"Register me to office relay."** The agent asks you for the machine
+In any session: **"Register me to agent intercom."** The agent asks you for the machine
 label, this session's role, and the hub URL + token, then calls `office_register`. The
 connection is saved to `~/.office-relay-agent.json` (override with `OFFICE_CONFIG`), so
 later you can just say "who's in the office?", "message the tex session…", "any mail?".

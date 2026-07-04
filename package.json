@@ -1,5 +1,5 @@
 {
-  "name": "office-relay",
+  "name": "agent-intercom",
   "version": "0.3.0",
   "private": false,
   "description": "Hub + MCP for cross-session Claude Code coordination: explicit session registry and inbox relay.",
@@ -14,9 +14,9 @@
     "pix:doctor": "pixtuoid doctor"
   },
   "bin": {
-    "office-relay": "hub/relay.mjs",
-    "office-relay-mcp": "mcp/server.mjs",
-    "office-relay-cli": "mcp/cli.mjs"
+    "agent-intercom": "hub/relay.mjs",
+    "agent-intercom-mcp": "mcp/server.mjs",
+    "agent-intercom-cli": "mcp/cli.mjs"
   },
   "dependencies": {},
   "devDependencies": {

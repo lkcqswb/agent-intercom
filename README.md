@@ -95,6 +95,8 @@ Any messages for me?                  → office_inbox
 | `office_status` | Show saved identity + hub health (token masked). |
 | `office_sessions` | List all registered sessions. |
 | `office_send` | Message an agent id, `dir:<folder>`, or `all`. |
+| `office_send_file` | Send a local file to another session (via the hub, ≤100 MB). |
+| `office_fetch` | Download a file another session sent you (by its fileId). |
 | `office_inbox` | Read this session's inbox (optionally mark read). |
 | `office_unregister` | Remove a session from the hub. |
 
@@ -107,6 +109,8 @@ export OFFICE_URL='http://<server-ip>:3977' OFFICE_TOKEN='<token>'
 node ~/.agent-intercom/mcp/cli.mjs register linux-baseline-1 "Linux Baseline" --role baseline --host linux-gpu --capabilities gpu,logs
 node ~/.agent-intercom/mcp/cli.mjs sessions
 node ~/.agent-intercom/mcp/cli.mjs send leader linux-baseline-1 "Run baseline A."
+node ~/.agent-intercom/mcp/cli.mjs send-file leader linux-baseline-1 ./config.yaml "use this"
+node ~/.agent-intercom/mcp/cli.mjs fetch <file-id> ./saved.yaml
 node ~/.agent-intercom/mcp/cli.mjs inbox leader --mark-read
 ```
 
@@ -125,6 +129,9 @@ node ~/.agent-intercom/mcp/cli.mjs inbox leader --mark-read
 | `OFFICE_STATE_PATH` | hub | next to `relay.mjs` | Persisted state (Docker: `/data/office-state.json`). |
 | `OFFICE_RATE_LIMIT` | hub | `240` | Max API requests/minute/IP (429 over limit). |
 | `OFFICE_MAX_BODY` | hub | `65536` | Max request body bytes (413 over limit). |
+| `OFFICE_MAX_FILE` | hub | `104857600` | Max upload file bytes (100 MB). |
+| `OFFICE_FILES_PATH` | hub | `<state dir>/files` | Where uploaded files are stored (Docker: `/data/files`). |
+| `OFFICE_FILE_TTL_MS` | hub | `86400000` | Delete uploaded files after this long (24h). |
 | `OFFICE_TRUST_PROXY` | hub | off | `1` to read client IP from `X-Forwarded-For`. |
 | `OFFICE_IDLE_MS` / `OFFICE_OFFLINE_MS` | hub | `45000` / `180000` | Mark agent idle / offline after inactivity. |
 | `OFFICE_AGENT_TTL_MS` | hub | `86400000` | Prune agents unseen this long (24h). |
@@ -161,9 +168,11 @@ also accept the read-only `OFFICE_VIEW_TOKEN`; everything else needs the full to
 - `GET /api/state` — agents + recent events. **Does not include message bodies.**
 - `GET /api/feed?limit=N` — agents + recent message stream (powers the office UI).
 - `POST /api/register` · `POST /api/heartbeat` · `POST|DELETE /api/unregister`
-- `POST /api/send` — `{ from, to, body }`; `to` may be an agent id, `dir:<query>`, or `all`.
+- `POST /api/send` — `{ from, to, body, file? }`; `to` may be an agent id, `dir:<query>`, or `all`.
 - `GET /api/inbox?agent=<id>[&unread=false]`
 - `POST /api/read` — `{ agent, ids? }`
+- `POST /api/file?name=&from=&to=` — upload raw bytes (≤ `OFFICE_MAX_FILE`), returns `{ id, name, size }`.
+- `GET /api/file/<id>` — download the file (full token only, not the view token).
 
 ## Reliability & hardening
 

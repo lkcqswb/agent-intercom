@@ -6,3 +6,5 @@ office-state.json
 hub/office-state.json
 **/*.log
 *.tmp
+hub/files/
+files/

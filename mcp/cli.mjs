@@ -1,6 +1,16 @@
 #!/usr/bin/env node
 
-import { loadConfig, getInbox, markRead } from "./client.mjs";
+import { readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
+import {
+  loadConfig,
+  getInbox,
+  markRead,
+  sendMessage,
+  uploadFile,
+  downloadFile,
+  humanSize,
+} from "./client.mjs";
 
 function readOption(name, fallback = "") {
   const prefix = `--${name}=`;
@@ -54,6 +64,8 @@ function usage() {
   node mcp/cli.mjs sessions
   node mcp/cli.mjs send <from> <to> <message...>
   node mcp/cli.mjs send-dir <from> <directory-query> <message...>
+  node mcp/cli.mjs send-file <from> <to> <path> [note...]
+  node mcp/cli.mjs fetch <file-id> [save-path]
   node mcp/cli.mjs inbox <agent-id> [--all] [--mark-read]
   node mcp/cli.mjs watch [agent-id] [--interval 10] [--once]
   node mcp/cli.mjs read <agent-id> [message-id...]
@@ -259,6 +271,35 @@ try {
       });
       console.log(`Marked ${messages.length} message(s) read.`);
     }
+  } else if (cmd === "send-file") {
+    const cleanArgs = stripOptions(args);
+    const [from, to, filePath, ...noteParts] = cleanArgs;
+    if (!from || !to || !filePath) throw new Error("from, to, and file path are required");
+    const cfg = await loadConfig();
+    const url = process.env.OFFICE_URL || cfg.url || baseUrl;
+    const token = process.env.OFFICE_TOKEN || cfg.token || "";
+    const buffer = await readFile(filePath);
+    const name = path.basename(filePath);
+    const up = await uploadFile(url, token, { name, from, to, buffer });
+    const note = noteParts.join(" ");
+    const message = await sendMessage(url, token, {
+      from,
+      to,
+      body: `${note ? note + " " : ""}\u{1F4CE} ${name} (${humanSize(up.size)}) — fetch with fileId=${up.id}`,
+      file: { id: up.id, name: up.name, size: up.size },
+    });
+    console.log(`sent file ${name} (${humanSize(up.size)}): ${message.from} -> ${message.to}  fileId=${up.id}`);
+  } else if (cmd === "fetch") {
+    const cleanArgs = stripOptions(args);
+    const [fileId, savePathArg] = cleanArgs;
+    if (!fileId) throw new Error("fileId is required");
+    const cfg = await loadConfig();
+    const url = process.env.OFFICE_URL || cfg.url || baseUrl;
+    const token = process.env.OFFICE_TOKEN || cfg.token || "";
+    const dl = await downloadFile(url, token, fileId);
+    const savePath = savePathArg || path.join(process.cwd(), dl.name || fileId);
+    await writeFile(savePath, dl.buffer);
+    console.log(`saved ${humanSize(dl.size)} to ${savePath}`);
   } else if (cmd === "watch") {
     // Inbox monitor. Polls for unread; on arrival it prints, marks them read, and
     // EXITS — in Claude Code a backgrounded command exiting re-invokes the agent,

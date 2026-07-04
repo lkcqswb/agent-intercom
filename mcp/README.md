@@ -28,6 +28,8 @@ later you can just say "who's in the office?", "message the tex session…", "an
 | `office_status` | — | Saved identity + hub health (token masked). |
 | `office_sessions` | — | List registered sessions. |
 | `office_send` | to, body, [from] | `to` = agent id, `dir:<folder>`, or `all`. |
+| `office_send_file` | to, path, [note, from] | Upload a local file and send it (via hub, ≤100 MB). |
+| `office_fetch` | fileId, [savePath] | Download a file another session sent you. |
 | `office_inbox` | [agent, unread, markRead] | Read this session's inbox. |
 | `office_unregister` | [agentId] | Remove a session. |
 
@@ -41,6 +43,8 @@ node cli.mjs register <id> [display-name] --role <role> --host <host> --capabili
 node cli.mjs sessions
 node cli.mjs send <from> <to> "<message>"
 node cli.mjs send-dir <from> <folder-query> "<message>"
+node cli.mjs send-file <from> <to> <path> [note...]
+node cli.mjs fetch <file-id> [save-path]
 node cli.mjs inbox <id> --mark-read
 ```
 

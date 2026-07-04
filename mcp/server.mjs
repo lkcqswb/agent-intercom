@@ -14,6 +14,8 @@
 // protocol messages may be written to stdout; logs go to stderr.
 
 import { fileURLToPath } from "node:url";
+import { readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 import {
   loadConfig,
   saveConfig,
@@ -24,6 +26,9 @@ import {
   getInbox,
   markRead,
   unregisterAgent,
+  uploadFile,
+  downloadFile,
+  humanSize,
   health,
   defaultHost,
 } from "./client.mjs";
@@ -149,6 +154,37 @@ const TOOLS = [
     },
   },
   {
+    name: "office_send_file",
+    description:
+      "Send a FILE to another registered session across machines. Reads a local file, " +
+      "uploads it to the hub, and posts a message referencing it; the recipient fetches it " +
+      "with office_fetch. 'to' may be an agent id, 'dir:<folder>', or 'all'.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        to: { type: "string", description: "Target: agent id, dir:<folder-query>, or all" },
+        path: { type: "string", description: "Absolute path of the local file to send" },
+        note: { type: "string", description: "Optional message to accompany the file" },
+        from: { type: "string", description: "Sender id (defaults to this session's registered id)" },
+      },
+      required: ["to", "path"],
+    },
+  },
+  {
+    name: "office_fetch",
+    description:
+      "Download a file that another session sent you (the message shows its fileId). " +
+      "Saves it to savePath, or to the current directory under its original name.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        fileId: { type: "string", description: "The file id from the message" },
+        savePath: { type: "string", description: "Where to save it (default: ./<original-name>)" },
+      },
+      required: ["fileId"],
+    },
+  },
+  {
     name: "office_unregister",
     description: "Remove a session from the hub. Defaults to this session's registered id.",
     inputSchema: {
@@ -266,6 +302,39 @@ async function callTool(name, args = {}) {
         out += `\n\n(marked ${messages.length} read)`;
       }
       return toolText(out);
+    }
+
+    case "office_send_file": {
+      const from = args.from || myId;
+      if (!from) return toolText("No sender id. Register this session first (office_register).", true);
+      if (!args.path) return toolText("A local file path is required.", true);
+      let buffer;
+      try {
+        buffer = await readFile(args.path);
+      } catch (error) {
+        return toolText(`Cannot read ${args.path}: ${error.message}`, true);
+      }
+      const name = path.basename(args.path);
+      const up = await uploadFile(url, token, { name, from, to: args.to, buffer });
+      const note = args.note ? args.note + " " : "";
+      const message = await sendMessage(url, token, {
+        from,
+        to: args.to,
+        body: `${note}📎 ${name} (${humanSize(up.size)}) — fetch with office_fetch fileId=${up.id}`,
+        cwd: cfg.agent?.cwd,
+        file: { id: up.id, name: up.name, size: up.size },
+      });
+      return toolText(
+        `Sent file "${name}" (${humanSize(up.size)}) to ${message.to} as message ${message.id} (fileId ${up.id}).`
+      );
+    }
+
+    case "office_fetch": {
+      if (!args.fileId) return toolText("A fileId is required.", true);
+      const dl = await downloadFile(url, token, args.fileId);
+      const savePath = args.savePath || path.join(process.cwd(), dl.name || args.fileId);
+      await writeFile(savePath, dl.buffer);
+      return toolText(`Saved ${humanSize(dl.size)} to ${savePath}`);
     }
 
     case "office_unregister": {

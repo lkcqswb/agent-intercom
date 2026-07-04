@@ -57,6 +57,53 @@ export const markRead = (url, token, agent, ids) =>
 export const unregisterAgent = (url, token, id) =>
   api(url, token, "/api/unregister", { method: "POST", body: { id } });
 
+export async function uploadFile(url, token, { name, from, to, buffer }) {
+  if (!url) throw new Error("no hub URL configured — register first or pass a url");
+  const q = new URLSearchParams({ name: name || "file", from: from || "", to: to || "" });
+  const res = await fetch(url.replace(/\/+$/, "") + "/api/file?" + q.toString(), {
+    method: "POST",
+    headers: {
+      "content-type": "application/octet-stream",
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
+    body: buffer,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
+  return data; // { id, name, size }
+}
+
+export async function downloadFile(url, token, id) {
+  if (!url) throw new Error("no hub URL configured — register first or pass a url");
+  const res = await fetch(url.replace(/\/+$/, "") + "/api/file/" + encodeURIComponent(id), {
+    headers: { ...(token ? { authorization: `Bearer ${token}` } : {}) },
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `${res.status} ${res.statusText}`);
+  }
+  let name = "";
+  const cd = res.headers.get("content-disposition") || "";
+  const m = cd.match(/filename\*=UTF-8''([^;]+)/i) || cd.match(/filename="?([^";]+)"?/i);
+  if (m) {
+    try {
+      name = decodeURIComponent(m[1]);
+    } catch {
+      name = m[1];
+    }
+  }
+  const buffer = Buffer.from(await res.arrayBuffer());
+  return { buffer, size: buffer.length, name };
+}
+
+export function humanSize(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
+  if (n < 1073741824) return (n / 1048576).toFixed(1) + " MB";
+  return (n / 1073741824).toFixed(2) + " GB";
+}
+
 export function defaultHost() {
   return process.env.OFFICE_AGENT_HOST || os.hostname() || "unknown-host";
 }

@@ -7,8 +7,9 @@ WORKDIR /app
 # The hub has no runtime dependencies; copy only what it needs to run.
 COPY relay.mjs ./relay.mjs
 
-# State lives on a mounted volume so it survives container restarts.
+# State + uploaded files live on a mounted volume so they survive restarts.
 ENV OFFICE_STATE_PATH=/data/office-state.json \
+    OFFICE_FILES_PATH=/data/files \
     OFFICE_HOST=0.0.0.0 \
     OFFICE_PORT=3977
 VOLUME ["/data"]

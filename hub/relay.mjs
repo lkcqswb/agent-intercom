@@ -1,14 +1,17 @@
 #!/usr/bin/env node
 
 import http from "node:http";
-import { readFile, writeFile, rename } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { readFile, writeFile, rename, mkdir, unlink } from "node:fs/promises";
+import { existsSync, createReadStream, createWriteStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
+import { Transform } from "node:stream";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const statePath = process.env.OFFICE_STATE_PATH || path.join(__dirname, "office-state.json");
+const filesDir = process.env.OFFICE_FILES_PATH || path.join(path.dirname(statePath), "files");
 const port = Number(process.env.OFFICE_PORT || 3977);
 const host = process.env.OFFICE_HOST || "127.0.0.1";
 const token = process.env.OFFICE_TOKEN || "";
@@ -22,6 +25,8 @@ const messageTtlMs = Number(process.env.OFFICE_MESSAGE_TTL_MS || 86400000); // d
 const unreadTtlMs = Number(process.env.OFFICE_UNREAD_TTL_MS || 604800000); // drop unread msgs after 7d
 const messagesMax = Number(process.env.OFFICE_MESSAGES_MAX || 5000);
 const maxBody = Number(process.env.OFFICE_MAX_BODY || 65536); // 64 KiB
+const maxFile = Number(process.env.OFFICE_MAX_FILE || 104857600); // 100 MiB
+const fileTtlMs = Number(process.env.OFFICE_FILE_TTL_MS || 86400000); // drop files after 24h
 const rateLimit = Number(process.env.OFFICE_RATE_LIMIT || 240); // requests/min/IP
 const trustProxy = process.env.OFFICE_TRUST_PROXY === "1";
 
@@ -39,6 +44,8 @@ Environment:
   OFFICE_STATE_PATH  Where to persist state. Default: alongside this file.
   OFFICE_RATE_LIMIT  Max API requests per minute per client IP. Default: 240
   OFFICE_MAX_BODY    Max request body bytes. Default: 65536
+  OFFICE_MAX_FILE    Max upload file bytes. Default: 104857600 (100 MiB)
+  OFFICE_FILES_PATH  Where uploaded files are stored. Default: <state dir>/files
   OFFICE_TRUST_PROXY Set to 1 to read client IP from X-Forwarded-For.
 
 Examples:
@@ -66,7 +73,7 @@ const viewHeader = viewToken ? `Bearer ${viewToken}` : "";
 // inside request handlers (Node is single-threaded, so there is no read/modify/
 // write interleaving), and are persisted via an atomic, serialized writer.
 // ---------------------------------------------------------------------------
-const defaultState = { agents: {}, messages: [], events: [] };
+const defaultState = { agents: {}, messages: [], events: [], files: {} };
 
 // Load once at startup (async, before listen).
 let state = structuredClone(defaultState);
@@ -237,6 +244,13 @@ function reconcile() {
     state.messages = state.messages.slice(-messagesMax);
   }
   if (state.messages.length !== before) changed = true;
+  for (const [id, f] of Object.entries(state.files || {})) {
+    if (now - (f.createdAt || 0) > fileTtlMs) {
+      delete state.files[id];
+      unlink(path.join(filesDir, id)).catch(() => {});
+      changed = true;
+    }
+  }
   return changed;
 }
 
@@ -316,6 +330,52 @@ async function handleApi(req, res, url) {
     });
   }
 
+  // ---- File transfer (blob store on the hub) ----
+  if (req.method === "POST" && url.pathname === "/api/file") {
+    const name = (url.searchParams.get("name") || "file").slice(0, 255);
+    const from = url.searchParams.get("from") || "";
+    const to = url.searchParams.get("to") || "";
+    const id = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+    await mkdir(filesDir, { recursive: true });
+    const dest = path.join(filesDir, id);
+    const tmp = dest + ".part";
+    let size = 0;
+    const counter = new Transform({
+      transform(chunk, _enc, cb) {
+        size += chunk.length;
+        if (size > maxFile) return cb(new Error("FILE_TOO_LARGE"));
+        cb(null, chunk);
+      },
+    });
+    try {
+      await pipeline(req, counter, createWriteStream(tmp));
+    } catch (error) {
+      await unlink(tmp).catch(() => {});
+      if (error.message === "FILE_TOO_LARGE") return json(res, 413, { error: "file too large" });
+      throw error;
+    }
+    await rename(tmp, dest);
+    state.files[id] = { id, name, size, from, to, createdAt: Date.now() };
+    addEvent("file", { id, name, size, from, to });
+    persist();
+    return json(res, 200, { id, name, size });
+  }
+
+  if (req.method === "GET" && url.pathname.startsWith("/api/file/")) {
+    const id = decodeURIComponent(url.pathname.slice("/api/file/".length));
+    if (!/^[a-f0-9]{6,40}$/i.test(id)) return json(res, 400, { error: "bad file id" });
+    const meta = state.files[id];
+    const p = path.join(filesDir, id);
+    if (!meta || !existsSync(p)) return json(res, 404, { error: "file not found" });
+    res.writeHead(200, {
+      "content-type": "application/octet-stream",
+      "content-length": String(meta.size),
+      "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(meta.name)}`,
+      "access-control-allow-origin": "*",
+    });
+    return void createReadStream(p).pipe(res);
+  }
+
   if (req.method === "POST" && url.pathname === "/api/register") {
     const data = await body(req);
     if (!data.id) return json(res, 400, { error: "id is required" });
@@ -384,6 +444,7 @@ async function handleApi(req, res, url) {
       createdAt: Date.now(),
       readAt: null,
       replyTo: data.replyTo || null,
+      file: data.file || null,
     };
     state.messages.push(message);
     if (state.messages.length > messagesMax) state.messages = state.messages.slice(-messagesMax);

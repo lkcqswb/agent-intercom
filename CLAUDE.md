@@ -5,8 +5,8 @@ This repo has two halves: a **hub** (`hub/`, the shared server) and an **MCP ser
 the client — never start a hub on the user's machine unless they explicitly ask.
 
 Registration and messaging go through the **`agent-intercom` MCP tools**
-(`office_register`, `office_status`, `office_sessions`, `office_send`, `office_inbox`,
-`office_unregister`). Prefer these over the CLI.
+(`office_register`, `office_status`, `office_sessions`, `office_send`, `office_send_file`,
+`office_fetch`, `office_inbox`, `office_unregister`). Prefer these over the CLI.
 
 ## When the user says "register me to agent intercom"
 

@@ -10,6 +10,11 @@
 // Then in any session: "register me to agent intercom" — the agent collects machine
 // info, role, hub URL and token from the user, calls office_register, and is in.
 //
+// Incoming mail is waited for HERE, in this long-lived process, not by the model:
+// an inbox pump long-polls the hub and hands messages to whatever delivery path the
+// session has (see docs/delivery-design.md), so no model turn is spent re-arming a
+// monitor.
+//
 // Protocol: MCP over stdio = newline-delimited JSON-RPC 2.0 messages. Nothing except
 // protocol messages may be written to stdout; logs go to stderr.
 
@@ -24,6 +29,7 @@ import {
   listState,
   sendMessage,
   getInbox,
+  waitInbox,
   markRead,
   unregisterAgent,
   uploadFile,
@@ -33,9 +39,14 @@ import {
   defaultHost,
 } from "./client.mjs";
 
-const SERVER_INFO = { name: "agent-intercom", version: "0.2.0" };
+const SERVER_INFO = { name: "agent-intercom", version: "0.4.0" };
 const DEFAULT_PROTOCOL = "2025-06-18";
 const CLI_PATH = fileURLToPath(new URL("./cli.mjs", import.meta.url));
+const MAX_WAIT_S = 86400; // office_wait / waitForReply upper bound
+const LEGACY_POLL_MS = 10000; // hubs without /api/inbox/wait are polled this often
+const PIGGYBACK_BUDGET = 4000; // max chars of unread mail appended to a tool result
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Presence: once THIS session registers, keep it "online" in the office with a
 // periodic heartbeat, and remove it when the session/process ends. Only the
@@ -64,6 +75,8 @@ let leaving = false;
 async function leaveOffice() {
   if (leaving) return;
   leaving = true;
+  pump.key = null;
+  for (const waiter of [...waiters]) waiter.resolve(null);
   if (beatTimer) clearInterval(beatTimer);
   if (mine) {
     try {
@@ -71,6 +84,159 @@ async function leaveOffice() {
     } catch {}
   }
   process.exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// Inbox pump: the one consumer of this session's inbox. It long-polls the hub and
+// hands each new message to a pending office_wait / waitForReply call that matches
+// it. Anything nobody waits for stays unread on the hub and is shown on the next
+// office_* tool result (piggyback), by office_inbox, or by the `watch` fallback.
+// The pump only ever serves the identity registered in THIS process: the shared
+// config file may name another session on this machine, whose mail is not ours.
+// ---------------------------------------------------------------------------
+const pump = { key: null, cursor: 0, legacy: false };
+const waiters = new Set(); // { match(message), wakeOnly, resolve(messages|null) }
+const claimed = new Set(); // ids this process already put in front of the model
+
+const isWake = (m) => m.wake !== false;
+const unclaimed = (messages) => messages.filter((m) => !claimed.has(m.id));
+
+// Record messages as seen by the model and clear them on the hub.
+function handOver(messages) {
+  if (!messages.length || !mine) return;
+  for (const m of messages) claimed.add(m.id);
+  if (claimed.size > 2000) {
+    for (const id of [...claimed].slice(0, claimed.size - 1000)) claimed.delete(id);
+  }
+  markRead(mine.url, mine.token, mine.agent.id, messages.map((m) => m.id)).catch(() => {});
+}
+
+function ensurePump() {
+  if (!mine || leaving) return;
+  const key = `${mine.url}|${mine.agent.id}`;
+  if (pump.key === key) return;
+  Object.assign(pump, { key, cursor: 0, legacy: false });
+  runPump(key, { ...mine }).catch((error) =>
+    process.stderr.write(`agent-intercom-mcp: inbox pump stopped: ${error.message}\n`)
+  );
+}
+
+async function runPump(key, { url, token, agent }) {
+  let failures = 0;
+  while (pump.key === key) {
+    let messages;
+    try {
+      messages = pump.legacy
+        ? await getInbox(url, token, agent.id, true)
+        : await waitInbox(url, token, agent.id, { after: pump.cursor });
+      failures = 0;
+    } catch (error) {
+      if (error.status === 404 && !pump.legacy) {
+        pump.legacy = true; // hub predates long-poll
+        continue;
+      }
+      failures += 1;
+      await sleep(Math.min(60000, 1000 * 2 ** Math.min(failures, 6)));
+      continue;
+    }
+    if (pump.key !== key) return;
+    for (const m of messages) pump.cursor = Math.max(pump.cursor, m.seq || 0);
+    dispatch(unclaimed(messages));
+    if (pump.legacy) await sleep(LEGACY_POLL_MS);
+  }
+}
+
+function dispatch(messages) {
+  for (const waiter of [...waiters]) {
+    const matched = messages.filter((m) => !claimed.has(m.id) && waiter.match(m));
+    if (!matched.length || (waiter.wakeOnly && !matched.some(isWake))) continue;
+    handOver(matched);
+    waiter.resolve(matched);
+  }
+}
+
+// Resolve with matching messages (already unread, or the next to arrive), or
+// null after timeoutMs. With wakeOnly, FYI-only mail does not end the wait.
+function waitForMessages({ match, wakeOnly, timeoutMs, onProgress }) {
+  ensurePump();
+  return new Promise((resolve) => {
+    let done = false;
+    const waiter = {
+      match,
+      wakeOnly,
+      resolve(messages) {
+        if (done) return;
+        done = true;
+        waiters.delete(waiter);
+        clearTimeout(timer);
+        clearInterval(ticker);
+        resolve(messages);
+      },
+    };
+    waiters.add(waiter);
+    const timer = setTimeout(() => waiter.resolve(null), timeoutMs);
+    const ticker = onProgress ? setInterval(onProgress, 30000) : null;
+    // Registered first, checked second: mail that landed before this call (or that
+    // the pump dispatched a moment before we registered) is still unread here.
+    getInbox(mine.url, mine.token, mine.agent.id, true)
+      .then((all) => {
+        const ready = unclaimed(all).filter(match);
+        if (done || !(wakeOnly ? ready.some(isWake) : ready.length)) return;
+        handOver(ready);
+        waiter.resolve(ready);
+      })
+      .catch(() => {});
+  });
+}
+
+function formatMessage(m) {
+  const tags = [`id ${m.id}`];
+  if (m.replyTo) tags.push(`reply to ${m.replyTo}`);
+  if (m.targetMode === "broadcast") tags.push("broadcast");
+  if (m.wake === false) tags.push("fyi");
+  return `[${new Date(m.createdAt).toISOString()}] ${m.from} -> ${m.to} (${tags.join(", ")})\n${m.body}`;
+}
+const formatMessages = (messages) => messages.map(formatMessage).join("\n\n");
+
+function sentLine(message) {
+  if (message.targetMode === "broadcast") {
+    return `Sent ${message.id}: ${message.from} -> all (${message.recipients?.length ?? 0} recipient(s))`;
+  }
+  const resolved = message.requestedTo !== message.to ? ` (resolved from ${message.requestedTo})` : "";
+  return `Sent ${message.id}: ${message.from} -> ${message.to}${resolved}`;
+}
+
+// Piggyback: unread mail rides along on whatever office_* tool the model calls
+// next, so it is seen without an extra inbox call or a wake-up of its own.
+async function appendUnread(result) {
+  if (!mine || leaving) return;
+  let unread;
+  try {
+    unread = await Promise.race([
+      getInbox(mine.url, mine.token, mine.agent.id, true),
+      sleep(3000).then(() => []),
+    ]);
+  } catch {
+    return;
+  }
+  const fresh = unclaimed(unread);
+  if (!fresh.length) return;
+  const shown = [];
+  let used = 0;
+  for (const m of fresh) {
+    const text = formatMessage(m);
+    if (shown.length && used + text.length > PIGGYBACK_BUDGET) break;
+    shown.push(m);
+    used += text.length;
+  }
+  handOver(shown);
+  const more = fresh.length - shown.length;
+  result.content.push({
+    type: "text",
+    text:
+      `📬 Unread mail for ${mine.agent.id} (now marked read):\n\n${formatMessages(shown)}` +
+      (more ? `\n\n(+${more} more unread — call office_inbox)` : ""),
+  });
 }
 
 function write(message) {
@@ -86,6 +252,24 @@ function toolText(text, isError = false) {
   return { content: [{ type: "text", text }], isError };
 }
 
+// Keep a long tool call alive for clients that time out idle calls (Claude Code
+// resets its MCP idle timer on progress). Only possible if the caller sent a token.
+function progressPinger(progressToken, label) {
+  if (progressToken === undefined) return undefined;
+  let n = 0;
+  return () =>
+    write({
+      jsonrpc: "2.0",
+      method: "notifications/progress",
+      params: { progressToken, progress: ++n, message: label },
+    });
+}
+
+function clampSeconds(value, fallback) {
+  const n = Number(value);
+  return Math.min(Math.max(Number.isFinite(n) && n > 0 ? n : fallback, 1), MAX_WAIT_S);
+}
+
 const TOOLS = [
   {
     name: "office_register",
@@ -95,22 +279,22 @@ const TOOLS = [
       "(2) role = this session's duty/positioning (e.g. leader, baseline, tex, reviewer); " +
       "(3) url = the hub address as http://IP:PORT; (4) token = the hub's shared token. " +
       "Also pick a short agentId. Capabilities and displayName are optional. " +
-      "The url and token are saved locally so later tools do not need them again. " +
-      "AFTER registering, start an inbox monitor (the tool result tells you the exact " +
-      "background command) so you notice messages other sessions send you.",
+      "The url and token are saved locally, so re-registering later can omit them. " +
+      "AFTER registering, follow the delivery note in the result: it says how this session " +
+      "will notice incoming messages.",
     inputSchema: {
       type: "object",
       properties: {
         agentId: { type: "string", description: "Short unique id for this session, e.g. mac-tex-1" },
         role: { type: "string", description: "Duty/positioning, e.g. leader, baseline, tex, reviewer" },
         host: { type: "string", description: "Machine label, e.g. macbook, linux-gpu" },
-        url: { type: "string", description: "Hub base URL, e.g. http://211.159.223.182:3977" },
-        token: { type: "string", description: "Hub shared bearer token" },
+        url: { type: "string", description: "Hub base URL, e.g. http://211.159.223.182:3977 (default: saved)" },
+        token: { type: "string", description: "Hub shared bearer token (default: saved)" },
         capabilities: { type: "string", description: "Optional comma list, e.g. gpu,experiments,tex" },
         displayName: { type: "string", description: "Optional human-friendly name" },
         cwd: { type: "string", description: "Optional project directory this session works in" },
       },
-      required: ["agentId", "role", "host", "url", "token"],
+      required: ["agentId", "role", "host"],
     },
   },
   {
@@ -129,27 +313,46 @@ const TOOLS = [
     name: "office_send",
     description:
       "Send a message to another registered session. 'to' may be an agent id, 'dir:<folder>' to reach " +
-      "whoever works in a directory, or 'all' to broadcast. 'from' defaults to this session's registered id.",
+      "whoever works in a directory, or 'all' to broadcast. Each message wakes its recipient, so batch " +
+      "points into one message and skip acknowledgements. Set waitForReply to block until the answer " +
+      "arrives (cheaper than going idle and being woken).",
     inputSchema: {
       type: "object",
       properties: {
         to: { type: "string", description: "Target: agent id, dir:<folder-query>, or all" },
         body: { type: "string", description: "Message text" },
+        replyTo: { type: "string", description: "Id of the message you are answering" },
+        wake: { type: "boolean", description: "false = FYI: delivered with the recipient's next mail instead of waking it (default true)" },
+        waitForReply: { type: "number", description: "Seconds to wait for the reply and return it (default: don't wait)" },
         from: { type: "string", description: "Sender id (defaults to this session's registered id)" },
       },
       required: ["to", "body"],
     },
   },
   {
+    name: "office_wait",
+    description:
+      "Block until a message arrives for this session (or timeoutSec passes) and return it. " +
+      "Use it when your next step depends on another session.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        timeoutSec: { type: "number", description: "Give up after this many seconds (default 600)" },
+        from: { type: "string", description: "Only wait for messages from this agent id" },
+      },
+    },
+  },
+  {
     name: "office_inbox",
     description:
-      "Read this session's inbox from the hub. Defaults to unread only; set markRead to clear them after reading.",
+      "Read this session's unread messages from the hub and mark them read. New mail is also shown " +
+      "automatically at the end of other office_* tool results.",
     inputSchema: {
       type: "object",
       properties: {
         agent: { type: "string", description: "Inbox owner id (defaults to this session's registered id)" },
         unread: { type: "boolean", description: "Only unread messages (default true)" },
-        markRead: { type: "boolean", description: "Mark the returned messages read (default false)" },
+        markRead: { type: "boolean", description: "Mark the returned messages read (default true for your own inbox)" },
       },
     },
   },
@@ -199,14 +402,30 @@ function mask(token) {
   return token.length <= 8 ? "****" : token.slice(0, 4) + "…" + token.slice(-4);
 }
 
-async function callTool(name, args = {}) {
+function deliveryNote(agent) {
+  return (
+    "NEXT — make sure you notice incoming messages. Run this as a BACKGROUND command; it " +
+    "long-polls your inbox and exits (printing the message) the moment mail arrives, " +
+    "which wakes you to respond — then relaunch it:\n" +
+    `  node ${CLI_PATH} watch ${agent.id}\n` +
+    "Mail is also shown at the end of any office_* tool result, and office_wait / " +
+    "office_send(waitForReply) block until it arrives."
+  );
+}
+
+async function callTool(name, args = {}, { progressToken } = {}) {
   const cfg = await loadConfig();
-  const url = args.url || cfg.url;
-  const token = args.token || cfg.token;
-  const myId = cfg.agent?.id;
+  // This process's registration wins over the shared config file, which only
+  // remembers whichever session on this machine registered last.
+  const url = args.url || mine?.url || cfg.url;
+  const token = args.token || mine?.token || cfg.token;
+  const myId = mine?.agent.id || cfg.agent?.id;
 
   switch (name) {
     case "office_register": {
+      const hubUrl = args.url || cfg.url;
+      const hubToken = args.token ?? cfg.token;
+      if (!hubUrl) return toolText("No hub url saved yet: ask the user for the hub url and token.", true);
       const agent = {
         id: args.agentId,
         name: args.displayName || args.agentId,
@@ -216,10 +435,10 @@ async function callTool(name, args = {}) {
         cwd: args.cwd || process.cwd(),
         backend: "mcp",
       };
-      const result = await registerAgent(args.url, args.token, agent);
+      const result = await registerAgent(hubUrl, hubToken, agent);
       await saveConfig({
-        url: args.url,
-        token: args.token,
+        url: hubUrl,
+        token: hubToken,
         agent: {
           id: agent.id,
           name: agent.name,
@@ -229,15 +448,13 @@ async function callTool(name, args = {}) {
           cwd: agent.cwd,
         },
       });
-      startPresence(args.url, args.token, agent); // keep online + auto-leave on exit
+      startPresence(hubUrl, hubToken, agent); // keep online + auto-leave on exit
+      ensurePump();
       return toolText(
-        `Registered "${agent.id}" with hub ${args.url}.\n` +
+        `Registered "${agent.id}" with hub ${hubUrl}.\n` +
           JSON.stringify(result, null, 2) +
-          "\n\nNEXT — start your inbox monitor so you notice incoming messages. Run this " +
-          "as a BACKGROUND command; it polls your inbox and exits (printing the message) " +
-          "the moment mail arrives, which wakes you to respond — then relaunch it:\n" +
-          `  node ${CLI_PATH} watch ${agent.id}\n` +
-          "When it surfaces a message, handle it, then start `watch` again to keep monitoring."
+          "\n\n" +
+          deliveryNote(agent)
       );
     }
 
@@ -250,11 +467,13 @@ async function callTool(name, args = {}) {
       } catch (e) {
         hubOk = `unreachable (${e.message})`;
       }
+      const agent = mine?.agent || cfg.agent;
       return toolText(
         `hub:   ${url}  [${hubOk}]\n` +
           `token: ${mask(token)}\n` +
           `agent: ${myId || "(not set)"}` +
-          (cfg.agent ? `\n  role: ${cfg.agent.role || ""}\n  host: ${cfg.agent.host || ""}\n  cwd:  ${cfg.agent.cwd || ""}` : "")
+          (mine ? "  (registered in this session)" : agent ? "  (saved config; not registered in this session)" : "") +
+          (agent ? `\n  role: ${agent.role || ""}\n  host: ${agent.host || ""}\n  cwd:  ${agent.cwd || ""}` : "")
       );
     }
 
@@ -274,31 +493,64 @@ async function callTool(name, args = {}) {
     case "office_send": {
       const from = args.from || myId;
       if (!from) return toolText("No sender id. Register this session first (office_register).", true);
+      const waitS = args.waitForReply ? clampSeconds(args.waitForReply, 600) : 0;
+      if (waitS && !mine) {
+        return toolText("waitForReply needs this session registered here (office_register).", true);
+      }
+      if (waitS) ensurePump();
       const message = await sendMessage(url, token, {
         from,
         to: args.to,
         body: args.body,
-        cwd: cfg.agent?.cwd,
+        cwd: (mine?.agent || cfg.agent)?.cwd,
+        ...(args.replyTo ? { replyTo: args.replyTo } : {}),
+        ...(args.wake === false ? { wake: false } : {}),
       });
-      const resolved = message.requestedTo !== message.to ? ` (resolved from ${message.requestedTo})` : "";
-      return toolText(`Sent ${message.id}: ${message.from} -> ${message.to}${resolved}`);
+      let out = sentLine(message);
+      if (waitS) {
+        const ids = new Set([message.id, ...(message.ids || [])]);
+        const peers = new Set(message.targetMode === "broadcast" ? message.recipients : [message.to]);
+        const newer = (m) =>
+          message.seq ? (m.seq || 0) > message.seq : (m.createdAt || 0) >= (message.createdAt || 0);
+        const replies = await waitForMessages({
+          match: (m) => (m.replyTo && ids.has(m.replyTo)) || (peers.has(m.from) && newer(m)),
+          wakeOnly: false,
+          timeoutMs: waitS * 1000,
+          onProgress: progressPinger(progressToken, `waiting for a reply to ${message.id}`),
+        });
+        out += replies
+          ? `\n\nReply:\n\n${formatMessages(replies)}`
+          : `\n\nNo reply within ${waitS}s; it will reach you like any other message.`;
+      }
+      return toolText(out);
+    }
+
+    case "office_wait": {
+      if (!mine) return toolText("This session is not registered here; call office_register first.", true);
+      const waitS = clampSeconds(args.timeoutSec, 600);
+      const from = args.from ? String(args.from) : "";
+      const messages = await waitForMessages({
+        match: (m) => !from || m.from === from,
+        wakeOnly: true,
+        timeoutMs: waitS * 1000,
+        onProgress: progressPinger(progressToken, "waiting for mail"),
+      });
+      return toolText(messages ? formatMessages(messages) : `No messages within ${waitS}s.`);
     }
 
     case "office_inbox": {
       const agent = args.agent || myId;
       if (!agent) return toolText("No inbox owner. Register this session first (office_register).", true);
       const unread = args.unread !== false;
+      const own = Boolean(mine) && agent === mine.agent.id;
       const messages = await getInbox(url, token, agent, unread);
-      let out;
-      if (!messages.length) {
-        out = `No ${unread ? "unread " : ""}messages for ${agent}.`;
-      } else {
-        out = messages
-          .map((m) => `[${m.id}] ${new Date(m.createdAt).toISOString()} ${m.from} -> ${m.to}\n${m.body}`)
-          .join("\n\n");
-      }
-      if (args.markRead && messages.length) {
-        await markRead(url, token, agent, messages.map((m) => m.id));
+      let out = messages.length
+        ? formatMessages(messages)
+        : `No ${unread ? "unread " : ""}messages for ${agent}.`;
+      const shouldMark = args.markRead ?? own;
+      if (shouldMark && messages.length) {
+        if (own) handOver(messages);
+        else await markRead(url, token, agent, messages.map((m) => m.id));
         out += `\n\n(marked ${messages.length} read)`;
       }
       return toolText(out);
@@ -321,7 +573,7 @@ async function callTool(name, args = {}) {
         from,
         to: args.to,
         body: `${note}📎 ${name} (${humanSize(up.size)}) — fetch with office_fetch fileId=${up.id}`,
-        cwd: cfg.agent?.cwd,
+        cwd: (mine?.agent || cfg.agent)?.cwd,
         file: { id: up.id, name: up.name, size: up.size },
       });
       return toolText(
@@ -341,6 +593,11 @@ async function callTool(name, args = {}) {
       const id = args.agentId || myId;
       if (!id) return toolText("No id to unregister.", true);
       const result = await unregisterAgent(url, token, id);
+      if (mine && id === mine.agent.id) {
+        pump.key = null;
+        if (beatTimer) clearInterval(beatTimer);
+        mine = null;
+      }
       return toolText(`Removed ${result.id}${result.existed ? "" : " (was not registered)"}`);
     }
 
@@ -365,7 +622,10 @@ async function handle(message) {
       return reply(id, { tools: TOOLS });
     }
     if (method === "tools/call") {
-      const result = await callTool(params?.name, params?.arguments || {});
+      const result = await callTool(params?.name, params?.arguments || {}, {
+        progressToken: params?._meta?.progressToken,
+      });
+      await appendUnread(result);
       return reply(id, result);
     }
     if (method === "ping") {

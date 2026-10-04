@@ -29,6 +29,9 @@ const maxFile = Number(process.env.OFFICE_MAX_FILE || 104857600); // 100 MiB
 const fileTtlMs = Number(process.env.OFFICE_FILE_TTL_MS || 86400000); // drop files after 24h
 const rateLimit = Number(process.env.OFFICE_RATE_LIMIT || 240); // requests/min/IP
 const trustProxy = process.env.OFFICE_TRUST_PROXY === "1";
+const waitMaxS = Number(process.env.OFFICE_WAIT_MAX_S || 50); // long-poll hold, below common proxy idle timeouts
+const pairRate = Number(process.env.OFFICE_PAIR_RATE || 30); // msgs/min from one sender to one target
+const dupWindowMs = Number(process.env.OFFICE_DUP_WINDOW_MS ?? 60000); // reject identical repeats; 0 disables
 
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
   console.log(`Usage:
@@ -47,6 +50,10 @@ Environment:
   OFFICE_MAX_FILE    Max upload file bytes. Default: 104857600 (100 MiB)
   OFFICE_FILES_PATH  Where uploaded files are stored. Default: <state dir>/files
   OFFICE_TRUST_PROXY Set to 1 to read client IP from X-Forwarded-For.
+  OFFICE_WAIT_MAX_S  Max seconds GET /api/inbox/wait holds a request. Default: 50
+  OFFICE_PAIR_RATE   Max messages/min from one sender to one target. Default: 30
+  OFFICE_DUP_WINDOW_MS  Reject an identical message to the same target within
+                     this window (loop guard). Default: 60000; 0 disables.
 
 Examples:
   npm run office
@@ -73,7 +80,7 @@ const viewHeader = viewToken ? `Bearer ${viewToken}` : "";
 // inside request handlers (Node is single-threaded, so there is no read/modify/
 // write interleaving), and are persisted via an atomic, serialized writer.
 // ---------------------------------------------------------------------------
-const defaultState = { agents: {}, messages: [], events: [], files: {} };
+const defaultState = { agents: {}, messages: [], events: [], files: {}, seq: 0 };
 
 // Load once at startup (async, before listen).
 let state = structuredClone(defaultState);
@@ -84,6 +91,16 @@ async function initState() {
   } catch {
     console.error(`agent-intercom: could not parse ${statePath}, starting fresh`);
   }
+  // Messages from before sequence numbers existed get one, in stored order.
+  let seq = state.seq || 0;
+  for (const m of state.messages) seq = Math.max(seq, m.seq || 0);
+  for (const m of state.messages) if (!m.seq) m.seq = ++seq;
+  state.seq = seq;
+}
+
+function nextSeq() {
+  state.seq = (state.seq || 0) + 1;
+  return state.seq;
 }
 
 let dirty = false;
@@ -194,6 +211,96 @@ function touch(id) {
     agent.lastSeen = Date.now();
     agent.status = "online";
   }
+}
+
+// Broadcasts are fanned out into one copy per recipient at send time, so each
+// recipient has its own read state and the sender never receives its own. The
+// `all` branch only matches messages stored before fan-out existed.
+function addressedTo(message, agent) {
+  return message.to === agent || (message.to === "all" && message.from !== agent);
+}
+
+function newMessageId() {
+  return crypto.randomUUID().slice(0, 8);
+}
+
+// ---------------------------------------------------------------------------
+// Loop guard: two agents auto-replying to each other would wake both sessions
+// forever, so cap messages per sender->target pair and reject identical repeats.
+// ---------------------------------------------------------------------------
+const pairBuckets = new Map();
+function loopGuard(from, to, text) {
+  const key = `${from}\u0000${to}`;
+  const now = Date.now();
+  const digest = crypto.createHash("sha1").update(String(text)).digest("hex");
+  let bucket = pairBuckets.get(key);
+  if (!bucket || now > bucket.resetAt) {
+    bucket = { count: 0, resetAt: now + 60000, lastDigest: bucket?.lastDigest, lastAt: bucket?.lastAt || 0 };
+    pairBuckets.set(key, bucket);
+  }
+  if (dupWindowMs > 0 && bucket.lastDigest === digest && now - bucket.lastAt < dupWindowMs) {
+    return `duplicate message: the same text was sent to ${to} less than ${Math.round(dupWindowMs / 1000)}s ago`;
+  }
+  bucket.count += 1;
+  if (bucket.count > pairRate) return `too many messages from ${from} to ${to} (limit ${pairRate}/min)`;
+  bucket.lastDigest = digest;
+  bucket.lastAt = now;
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Long-poll waiters (GET /api/inbox/wait). A waiter holds its response open until
+// a matching unread message arrives or its timeout passes, so clients learn about
+// mail immediately without polling.
+// ---------------------------------------------------------------------------
+const waiters = new Map(); // agent id -> Set<{ res, after, wakeOnly, timer }>
+
+function pendingFor(agent, after = 0, unreadOnly = true) {
+  return state.messages.filter(
+    (m) => addressedTo(m, agent) && (!unreadOnly || !m.readAt) && (m.seq || 0) > after
+  );
+}
+
+function dropWaiter(agent, waiter) {
+  clearTimeout(waiter.timer);
+  const set = waiters.get(agent);
+  if (!set) return;
+  set.delete(waiter);
+  if (!set.size) waiters.delete(agent);
+}
+
+// Answer the waiter if it is satisfied (or unconditionally on timeout).
+function settleWaiter(agent, waiter, timedOut = false) {
+  const messages = pendingFor(agent, waiter.after);
+  const ready = waiter.wakeOnly ? messages.some((m) => m.wake !== false) : messages.length > 0;
+  if (!ready && !timedOut) return false;
+  dropWaiter(agent, waiter);
+  touch(agent);
+  if (!waiter.res.writableEnded) json(waiter.res, 200, ready ? messages : []);
+  return true;
+}
+
+function deliver(messages) {
+  for (const agent of new Set(messages.map((m) => m.to))) {
+    for (const waiter of [...(waiters.get(agent) || [])]) settleWaiter(agent, waiter);
+  }
+}
+
+// The office UI shows a broadcast once, not once per recipient copy.
+function feedMessages(limit) {
+  const out = [];
+  const seen = new Set();
+  for (let i = state.messages.length - 1; i >= 0 && out.length < limit; i -= 1) {
+    const m = state.messages[i];
+    if (m.broadcastId) {
+      if (seen.has(m.broadcastId)) continue;
+      seen.add(m.broadcastId);
+      out.push({ ...m, id: m.broadcastId, to: "all" });
+    } else {
+      out.push(m);
+    }
+  }
+  return out.reverse();
 }
 
 function resolveTarget(to, from) {
@@ -325,7 +432,7 @@ async function handleApi(req, res, url) {
       now: Date.now(),
       youAre: level,
       agents: state.agents,
-      messages: state.messages.slice(-limit),
+      messages: feedMessages(limit),
       events: state.events.slice(-60),
     });
   }
@@ -379,6 +486,9 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && url.pathname === "/api/register") {
     const data = await body(req);
     if (!data.id) return json(res, 400, { error: "id is required" });
+    if (data.id === "all" || /^(dir|cwd):/.test(data.id)) {
+      return json(res, 400, { error: `"${data.id}" is reserved for addressing; pick another id` });
+    }
     state.agents[data.id] = placeAgent(data.id, data.name, {
       cwd: data.cwd,
       sessionId: data.sessionId,
@@ -432,37 +542,92 @@ async function handleApi(req, res, url) {
     } else {
       touch(data.from);
     }
-    const target = resolveTarget(data.to, data.from);
-    const message = {
-      id: crypto.randomUUID().slice(0, 8),
+    const blocked = loopGuard(data.from, data.to, data.body);
+    if (blocked) return json(res, 429, { error: blocked });
+    const base = {
       from: data.from,
-      to: target.id,
       requestedTo: data.to,
-      targetMode: target.mode,
       body: data.body,
       status: "queued",
       createdAt: Date.now(),
       readAt: null,
       replyTo: data.replyTo || null,
       file: data.file || null,
+      // wake:false marks an FYI: it is stored and shown on the recipient's next
+      // inbox read, but long-poll waiters asking for wake-worthy mail ignore it.
+      wake: data.wake !== false,
+    };
+    if (data.to === "all") {
+      const broadcastId = newMessageId();
+      const recipients = Object.keys(state.agents).filter((id) => id !== data.from);
+      const copies = recipients.map((id) => ({
+        ...base,
+        id: newMessageId(),
+        seq: nextSeq(),
+        to: id,
+        targetMode: "broadcast",
+        broadcastId,
+      }));
+      state.messages.push(...copies);
+      if (state.messages.length > messagesMax) state.messages = state.messages.slice(-messagesMax);
+      addEvent("message", { id: broadcastId, from: data.from, to: "all", recipients: recipients.length });
+      persist();
+      deliver(copies);
+      return json(res, 200, {
+        ...base,
+        id: broadcastId,
+        seq: state.seq,
+        to: "all",
+        targetMode: "broadcast",
+        recipients,
+        ids: copies.map((c) => c.id),
+      });
+    }
+    const target = resolveTarget(data.to, data.from);
+    const message = {
+      ...base,
+      id: newMessageId(),
+      seq: nextSeq(),
+      to: target.id,
+      targetMode: target.mode,
     };
     state.messages.push(message);
     if (state.messages.length > messagesMax) state.messages = state.messages.slice(-messagesMax);
     addEvent("message", { id: message.id, from: data.from, to: target.id });
     persist();
+    deliver([message]);
     return json(res, 200, message);
   }
 
   if (req.method === "GET" && url.pathname === "/api/inbox") {
     const agent = url.searchParams.get("agent");
     const unreadOnly = url.searchParams.get("unread") !== "false";
+    const after = Number(url.searchParams.get("after")) || 0;
     if (!agent) return json(res, 400, { error: "agent is required" });
     touch(agent);
-    const messages = state.messages.filter((m) => {
-      const addressed = m.to === agent || m.to === "all";
-      return addressed && (!unreadOnly || !m.readAt);
-    });
-    return json(res, 200, messages);
+    return json(res, 200, pendingFor(agent, after, unreadOnly));
+  }
+
+  // Long-poll: answers as soon as `agent` has unread mail with seq > after (with
+  // wake=1, only once some of it is wake-worthy), or with [] after `timeout` s.
+  if (req.method === "GET" && url.pathname === "/api/inbox/wait") {
+    const agent = url.searchParams.get("agent");
+    if (!agent) return json(res, 400, { error: "agent is required" });
+    const requested = Number(url.searchParams.get("timeout"));
+    const timeoutS = Math.min(Math.max(Number.isFinite(requested) ? requested : waitMaxS, 0), waitMaxS);
+    const waiter = {
+      res,
+      after: Number(url.searchParams.get("after")) || 0,
+      wakeOnly: url.searchParams.get("wake") === "1",
+      timer: null,
+    };
+    touch(agent);
+    if (settleWaiter(agent, waiter, timeoutS === 0)) return;
+    if (!waiters.has(agent)) waiters.set(agent, new Set());
+    waiters.get(agent).add(waiter);
+    waiter.timer = setTimeout(() => settleWaiter(agent, waiter, true), timeoutS * 1000);
+    res.on("close", () => dropWaiter(agent, waiter));
+    return;
   }
 
   if (req.method === "POST" && url.pathname === "/api/read") {
@@ -472,7 +637,7 @@ async function handleApi(req, res, url) {
     const ids = new Set(data.ids || []);
     touch(agent);
     for (const message of state.messages) {
-      if ((message.to === agent || message.to === "all") && (ids.size === 0 || ids.has(message.id))) {
+      if (addressedTo(message, agent) && (ids.size === 0 || ids.has(message.id))) {
         message.status = "read";
         message.readAt = message.readAt || Date.now();
       }
@@ -623,6 +788,9 @@ const reconcileTimer = setInterval(() => {
   const now = Date.now();
   for (const [ip, bucket] of buckets) {
     if (now > bucket.resetAt) buckets.delete(ip);
+  }
+  for (const [key, bucket] of pairBuckets) {
+    if (now > bucket.resetAt && now - bucket.lastAt > dupWindowMs) pairBuckets.delete(key);
   }
   if (changed) persist();
 }, 30000);

@@ -38,7 +38,11 @@ export async function api(url, token, p, { method = "GET", body } = {}) {
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    const error = new Error(data.error || `${res.status} ${res.statusText}`);
+    error.status = res.status;
+    throw error;
+  }
   return data;
 }
 
@@ -52,6 +56,16 @@ export const sendMessage = (url, token, message) =>
   api(url, token, "/api/send", { method: "POST", body: message });
 export const getInbox = (url, token, agent, unread = true) =>
   api(url, token, `/api/inbox?agent=${encodeURIComponent(agent)}&unread=${unread}`);
+// Long-poll the hub: resolves with unread messages newer than `after` as soon as
+// any arrive (with wakeOnly, once one of them is wake-worthy), or [] on timeout.
+// Throws with status 404 on hubs that predate the endpoint.
+export const waitInbox = (url, token, agent, { after = 0, timeout = 50, wakeOnly = false } = {}) =>
+  api(
+    url,
+    token,
+    `/api/inbox/wait?agent=${encodeURIComponent(agent)}&after=${after}&timeout=${timeout}` +
+      (wakeOnly ? "&wake=1" : "")
+  );
 export const markRead = (url, token, agent, ids) =>
   api(url, token, "/api/read", { method: "POST", body: { agent, ids } });
 export const unregisterAgent = (url, token, id) =>

@@ -1,6 +1,6 @@
 {
   "name": "agent-intercom",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": false,
   "description": "Hub + MCP for cross-session Claude Code coordination: explicit session registry and inbox relay.",
   "type": "module",
@@ -9,6 +9,7 @@
     "office": "node hub/relay.mjs",
     "office:mcp": "node mcp/server.mjs",
     "office:cli": "node mcp/cli.mjs",
+    "test": "node --test test/*.test.mjs",
     "pix": "pixtuoid",
     "pix:setup": "pixtuoid setup",
     "pix:doctor": "pixtuoid doctor"

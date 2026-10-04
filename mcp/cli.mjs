@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   loadConfig,
   getInbox,
+  waitInbox,
   markRead,
   sendMessage,
   uploadFile,
@@ -24,6 +25,43 @@ function readOption(name, fallback = "") {
 const baseUrl = process.env.OFFICE_URL || "http://127.0.0.1:3977";
 const cwd = readOption("cwd") || process.env.OFFICE_AGENT_CWD || process.cwd();
 const defaultHost = process.env.OFFICE_AGENT_HOST || process.env.COMPUTERNAME || process.env.HOSTNAME || "unknown-host";
+
+// Remove `--name value` / `--name=value` from args (mutating) and return the value.
+function takeOption(args, name) {
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === `--${name}`) return args.splice(i, 2)[1] || "";
+    if (args[i].startsWith(`--${name}=`)) return args.splice(i, 1)[0].slice(name.length + 3);
+  }
+  return "";
+}
+
+// Remove a value-less `--name` flag from args (mutating) and report whether it was there.
+function takeFlag(args, name) {
+  const index = args.indexOf(`--${name}`);
+  if (index < 0) return false;
+  args.splice(index, 1);
+  return true;
+}
+
+function sentLine(message) {
+  if (message.targetMode === "broadcast") {
+    return `sent ${message.id}: ${message.from} -> all (${message.recipients?.length ?? 0} recipient(s))`;
+  }
+  const resolved = message.requestedTo !== message.to ? ` (resolved from ${message.requestedTo})` : "";
+  return `sent ${message.id}: ${message.from} -> ${message.to}${resolved}`;
+}
+
+function printMessages(messages) {
+  for (const m of messages) {
+    const tags = [m.replyTo ? `reply to ${m.replyTo}` : "", m.wake === false ? "fyi" : ""].filter(Boolean);
+    console.log(
+      `[${m.id}] ${new Date(m.createdAt).toLocaleTimeString()} ${m.from} -> ${m.to}` +
+        (tags.length ? ` (${tags.join(", ")})` : "")
+    );
+    console.log(m.body);
+    console.log("");
+  }
+}
 
 function stripOptions(args) {
   const output = [];
@@ -62,12 +100,12 @@ function usage() {
   node mcp/cli.mjs unregister <agent-id>
   node mcp/cli.mjs heartbeat <agent-id> [status]
   node mcp/cli.mjs sessions
-  node mcp/cli.mjs send <from> <to> <message...>
+  node mcp/cli.mjs send <from> <to> <message...> [--reply-to <message-id>] [--fyi]
   node mcp/cli.mjs send-dir <from> <directory-query> <message...>
   node mcp/cli.mjs send-file <from> <to> <path> [note...]
   node mcp/cli.mjs fetch <file-id> [save-path]
   node mcp/cli.mjs inbox <agent-id> [--all] [--mark-read]
-  node mcp/cli.mjs watch [agent-id] [--interval 10] [--once]
+  node mcp/cli.mjs watch [agent-id] [--once] [--interval 10]
   node mcp/cli.mjs read <agent-id> [message-id...]
   node mcp/cli.mjs state
 
@@ -233,14 +271,23 @@ try {
       }
     }
   } else if (cmd === "send") {
-    const [from, to, ...messageParts] = args;
+    const rest = [...args];
+    const replyTo = takeOption(rest, "reply-to");
+    const fyi = takeFlag(rest, "fyi");
+    const [from, to, ...messageParts] = rest;
     if (!from || !to || messageParts.length === 0) throw new Error("from, to, and message are required");
     const message = await api("/api/send", {
       method: "POST",
-      body: JSON.stringify({ from, to, body: messageParts.join(" "), cwd }),
+      body: JSON.stringify({
+        from,
+        to,
+        body: messageParts.join(" "),
+        cwd,
+        ...(replyTo ? { replyTo } : {}),
+        ...(fyi ? { wake: false } : {}),
+      }),
     });
-    const resolved = message.requestedTo !== message.to ? ` (resolved from ${message.requestedTo})` : "";
-    console.log(`sent ${message.id}: ${message.from} -> ${message.to}${resolved}`);
+    console.log(sentLine(message));
   } else if (cmd === "send-dir") {
     const [from, dir, ...messageParts] = args;
     if (!from || !dir || messageParts.length === 0) throw new Error("from, directory-query, and message are required");
@@ -257,12 +304,7 @@ try {
     if (messages.length === 0) {
       console.log(`No ${unread ? "unread " : ""}messages for ${agent}.`);
     } else {
-      for (const m of messages) {
-        const at = new Date(m.createdAt).toLocaleTimeString();
-        console.log(`[${m.id}] ${at} ${m.from} -> ${m.to}`);
-        console.log(m.body);
-        console.log("");
-      }
+      printMessages(messages);
     }
     if (args.includes("--mark-read") && messages.length > 0) {
       await api("/api/read", {
@@ -301,9 +343,12 @@ try {
     await writeFile(savePath, dl.buffer);
     console.log(`saved ${humanSize(dl.size)} to ${savePath}`);
   } else if (cmd === "watch") {
-    // Inbox monitor. Polls for unread; on arrival it prints, marks them read, and
-    // EXITS — in Claude Code a backgrounded command exiting re-invokes the agent,
-    // so this is how a session "wakes up" to a new message. Then relaunch it.
+    // Inbox monitor, the fallback for sessions without push delivery (see
+    // docs/delivery-design.md). It long-polls the hub and, once wake-worthy mail
+    // arrives, prints everything unread, marks it read, and EXITS — in Claude Code
+    // a backgrounded command exiting re-invokes the agent. FYI (wake:false)
+    // messages never end the watch on their own; they ride along with the next
+    // wake-worthy one. Hubs without /api/inbox/wait are polled every --interval s.
     const cfg = await loadConfig();
     const id = stripOptions(args)[0] || cfg.agent?.id;
     if (!id) throw new Error("agent-id required (or register first so it is saved)");
@@ -312,28 +357,35 @@ try {
     const intervalMs = Math.max(2, Number(readOption("interval")) || 10) * 1000;
     const once = args.includes("--once");
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    let legacy = false;
+    let messages = [];
     for (;;) {
-      let messages = null;
       try {
-        messages = await getInbox(url, token, id, true);
-      } catch (error) {
-        console.error(`office: ${error.message}`);
-      }
-      if (messages && messages.length) {
-        console.log(`\u{1F4EC} ${messages.length} new message(s) for ${id}:`);
-        for (const m of messages) {
-          console.log(`[${m.id}] ${new Date(m.createdAt).toLocaleTimeString()} ${m.from} -> ${m.to}`);
-          console.log(m.body);
-          console.log("");
+        if (once || legacy) {
+          messages = await getInbox(url, token, id, true);
+          if (!once && !messages.some((m) => m.wake !== false)) messages = [];
+        } else {
+          messages = await waitInbox(url, token, id, { wakeOnly: true });
         }
-        await markRead(url, token, id, messages.map((m) => m.id)).catch(() => {});
-        break;
+      } catch (error) {
+        if (error.status === 404 && !legacy) {
+          legacy = true;
+          continue;
+        }
+        console.error(`office: ${error.message}`);
+        messages = [];
+        await sleep(intervalMs);
+        continue;
       }
-      if (once) {
-        console.log(`No new messages for ${id}.`);
-        break;
-      }
-      await sleep(intervalMs);
+      if (messages.length || once) break;
+      if (legacy) await sleep(intervalMs);
+    }
+    if (!messages.length) {
+      console.log(`No new messages for ${id}.`);
+    } else {
+      console.log(`\u{1F4EC} ${messages.length} new message(s) for ${id}:`);
+      printMessages(messages);
+      await markRead(url, token, id, messages.map((m) => m.id)).catch(() => {});
     }
   } else if (cmd === "read") {
     const [agent, ...ids] = args;

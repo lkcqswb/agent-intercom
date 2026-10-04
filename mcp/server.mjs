@@ -13,13 +13,16 @@
 // Incoming mail is waited for HERE, in this long-lived process, not by the model:
 // an inbox pump long-polls the hub and hands messages to whatever delivery path the
 // session has (see docs/delivery-design.md), so no model turn is spent re-arming a
-// monitor.
+// monitor. In Claude Code started with this server as a channel, mail is pushed
+// into the conversation as <channel source="agent-intercom"> events.
 //
 // Protocol: MCP over stdio = newline-delimited JSON-RPC 2.0 messages. Nothing except
 // protocol messages may be written to stdout; logs go to stderr.
 
 import { fileURLToPath } from "node:url";
 import { readFile, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import {
   loadConfig,
@@ -54,6 +57,71 @@ const STOP_HOOK_WAIT_S = 3500; // suggested office_wait timeout for the Stop hoo
 const MCP_NAME = process.env.OFFICE_MCP_NAME || "agent-intercom";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Read once by the client at connect time (MCP `instructions`).
+const INSTRUCTIONS =
+  "Agent Intercom relays messages between registered agent sessions. Incoming mail reaches you as " +
+  '<channel source="agent-intercom" from="..." msg_id="..."> events, at the end of office_* tool results ' +
+  "under 📬, or from office_wait. Answer with office_send(to=<sender>, replyTo=<msg_id>). Every message " +
+  "wakes its recipient and costs it a turn: don't send acknowledgements or thanks, batch related points " +
+  "into one message, and pass wake=false for FYIs that need no action.";
+
+// ---------------------------------------------------------------------------
+// Claude Code channel push (research preview). Claude Code only registers this
+// server as a channel when started with
+//   claude --dangerously-load-development-channels server:agent-intercom
+// and silently drops channel events otherwise, so push is used only when that
+// flag is on the command line of an ancestor process (OFFICE_PUSH=channel forces
+// it, OFFICE_PUSH=off disables it).
+// ---------------------------------------------------------------------------
+function ancestorCommandLines(depth = 4) {
+  const lines = [];
+  let pid = process.ppid;
+  for (let i = 0; i < depth && pid > 1; i += 1) {
+    try {
+      if (process.platform === "linux") {
+        lines.push(readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").join(" "));
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        pid = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
+      } else if (process.platform === "darwin") {
+        const out = execFileSync("ps", ["-o", "ppid=,args=", "-p", String(pid)], { encoding: "utf8" });
+        const match = out.trim().match(/^(\d+)\s+([\s\S]*)$/);
+        if (!match) break;
+        lines.push(match[2]);
+        pid = Number(match[1]);
+      } else {
+        break;
+      }
+    } catch {
+      break;
+    }
+  }
+  return lines;
+}
+
+function launchedAsChannel() {
+  const name = MCP_NAME.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`--(dangerously-load-development-)?channels[=\\s][\\s\\S]*server:${name}(?![\\w-])`);
+  return ancestorCommandLines().some((line) => pattern.test(line));
+}
+
+const pushMode = (process.env.OFFICE_PUSH || "auto").toLowerCase();
+let channelOn = null;
+function channelActive() {
+  if (channelOn === null) {
+    channelOn = pushMode === "channel" || (pushMode === "auto" && launchedAsChannel());
+  }
+  return channelOn;
+}
+
+function pushToChannel(m) {
+  // Meta keys must be identifiers; each becomes an attribute of the <channel> tag.
+  const meta = { from: m.from, msg_id: m.id };
+  if (m.replyTo) meta.reply_to = m.replyTo;
+  if (m.file?.id) meta.file_id = m.file.id;
+  if (m.targetMode === "broadcast") meta.broadcast = "true";
+  write({ jsonrpc: "2.0", method: "notifications/claude/channel", params: { content: m.body, meta } });
+}
 
 // Presence: once THIS session registers, keep it "online" in the office with a
 // periodic heartbeat, and remove it when the session/process ends. Only the
@@ -96,8 +164,9 @@ async function leaveOffice() {
 
 // ---------------------------------------------------------------------------
 // Inbox pump: the one consumer of this session's inbox. It long-polls the hub and
-// hands each new message to a pending office_wait / waitForReply call that matches
-// it. Anything nobody waits for stays unread on the hub and is shown on the next
+// hands each new message to, in order: a pending office_wait / waitForReply call
+// that matches it; the Claude Code channel, when this session runs as one (FYIs
+// excluded). Anything left stays unread on the hub and is shown on the next
 // office_* tool result (piggyback), by office_inbox, or by the `watch` fallback.
 // The pump only ever serves the identity registered in THIS process: the shared
 // config file may name another session on this machine, whose mail is not ours.
@@ -162,6 +231,10 @@ function dispatch(messages) {
     handOver(matched);
     waiter.resolve(matched);
   }
+  if (!channelActive()) return;
+  const pushed = messages.filter((m) => !claimed.has(m.id) && isWake(m));
+  for (const m of pushed) pushToChannel(m);
+  handOver(pushed);
 }
 
 // Resolve with matching messages (already unread, or the next to arrive), or
@@ -455,6 +528,24 @@ function mask(token) {
 }
 
 function deliveryNote(agent) {
+  if (channelActive()) {
+    return (
+      "DELIVERY — push is on: incoming messages arrive in this conversation by themselves as " +
+      '<channel source="agent-intercom" from="..." msg_id="..."> events, even while you are idle. ' +
+      "Do not start an inbox monitor."
+    );
+  }
+  if (/claude/i.test(client.name)) {
+    return (
+      "DELIVERY — push is off: Claude Code was not started with " +
+      `\`--dangerously-load-development-channels server:${MCP_NAME}\` (channels are a research ` +
+      "preview). With that flag messages arrive here by themselves and no monitor is needed; mention " +
+      "it to the user. Until then, run this as a BACKGROUND command; it exits (printing the message) " +
+      "the moment mail arrives, which wakes you — relaunch it after each message:\n" +
+      `  node ${CLI_PATH} watch ${agent.id}\n` +
+      "Mail is also shown at the end of any office_* tool result."
+    );
+  }
   if (/codex/i.test(client.name)) {
     return (
       "DELIVERY — Codex has no background wake-up, so: while you work, new mail is shown at the " +
@@ -693,8 +784,11 @@ async function handle(message) {
       client = params?.clientInfo || client;
       return reply(id, {
         protocolVersion: params?.protocolVersion || DEFAULT_PROTOCOL,
-        capabilities: { tools: {} },
+        // claude/channel lets Claude Code accept pushed messages; other clients
+        // ignore unknown experimental capabilities.
+        capabilities: { tools: {}, experimental: { "claude/channel": {} } },
         serverInfo: SERVER_INFO,
+        instructions: INSTRUCTIONS,
       });
     }
     if (method === "tools/list") {

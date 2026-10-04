@@ -44,10 +44,27 @@ after(async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
-// Minimal MCP client over stdio.
-function startMcp(name, extraEnv = {}) {
-  const child = spawn(process.execPath, [path.join(root, "mcp/server.mjs")], {
-    env: { ...process.env, OFFICE_CONFIG: path.join(dir, `${name}.json`), OFFICE_PUSH: "", ...extraEnv },
+// Minimal MCP client over stdio. `parentArgs` runs the server under a wrapper
+// process carrying those args, standing in for `claude <flags>` as its parent.
+function startMcp(name, extraEnv = {}, parentArgs = null) {
+  const server = path.join(root, "mcp/server.mjs");
+  const argv = parentArgs
+    ? [
+        "-e",
+        "require('child_process').spawn(process.execPath,[process.env.MCP_SERVER],{stdio:'inherit'})" +
+          ".on('exit',(c)=>process.exit(c??0))",
+        "--",
+        ...parentArgs,
+      ]
+    : [server];
+  const child = spawn(process.execPath, argv, {
+    env: {
+      ...process.env,
+      OFFICE_CONFIG: path.join(dir, `${name}.json`),
+      OFFICE_PUSH: "",
+      MCP_SERVER: server,
+      ...extraEnv,
+    },
     stdio: ["pipe", "pipe", "ignore"],
   });
   const pending = new Map();
@@ -93,7 +110,10 @@ function startMcp(name, extraEnv = {}) {
       request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: clientName, version: "1" } }),
     register: (agentId, extra = {}) =>
       call("office_register", { agentId, role: "test", host: "ci", url: hubUrl, token: "", ...extra }),
-    stop: () => child.kill(),
+    stop: () => {
+      child.stdin.end(); // the server leaves the office on stdin EOF
+      child.kill();
+    },
   };
 }
 
@@ -313,4 +333,56 @@ test("CLI watch --stop-hook prints hook JSON on mail and nothing on timeout", as
   const decision = JSON.parse(loud.out);
   assert.equal(decision.decision, "block");
   assert.match(decision.reason, /wake up/);
+});
+
+const CHANNEL_FLAGS = ["--dangerously-load-development-channels", "server:agent-intercom"];
+
+test("launched as a Claude Code channel: wake-worthy mail is pushed, FYIs are not", async () => {
+  const a = startMcp("ch-a");
+  const b = startMcp("ch-b", {}, CHANNEL_FLAGS);
+  try {
+    await a.init();
+    const hello = await b.init("claude-code");
+    assert.deepEqual(hello.result.capabilities.experimental, { "claude/channel": {} });
+    assert.match(hello.result.instructions, /replyTo/);
+    await a.register("ch-a");
+    assert.match(await b.register("ch-b"), /push is on/);
+
+    await a.call("office_send", { to: "ch-b", body: "just so you know", wake: false });
+    const sent = await a.call("office_send", { to: "ch-b", body: "please review PR 7" });
+    const id = sent.match(/Sent (\w+)/)[1];
+    const pushedTo = () => b.notifications.filter((n) => n.method === "notifications/claude/channel");
+    assert.ok(await until(() => pushedTo().length > 0), "a channel event was emitted");
+    const [event] = pushedTo();
+    assert.equal(event.params.content, "please review PR 7");
+    assert.deepEqual(event.params.meta, { from: "ch-a", msg_id: id });
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(pushedTo().length, 1, "the FYI was not pushed");
+    const unread = await api("/api/inbox?agent=ch-b");
+    assert.deepEqual(unread.map((m) => m.body), ["just so you know"], "pushed mail is marked read; the FYI waits");
+  } finally {
+    a.stop();
+    b.stop();
+  }
+});
+
+test("no push without the channel flag for this server, or with OFFICE_PUSH=off", async () => {
+  const other = startMcp("np-a", {}, ["--dangerously-load-development-channels", "server:agent-intercom-2"]);
+  const off = startMcp("np-b", { OFFICE_PUSH: "off" }, CHANNEL_FLAGS);
+  try {
+    await other.init("claude-code");
+    await off.init("claude-code");
+    assert.match(await other.register("np-a"), /push is off/);
+    assert.match(await off.register("np-b"), /--dangerously-load-development-channels server:agent-intercom/);
+    await api("/api/send", { method: "POST", body: { from: "np-z", to: "np-a", body: "hi a" } });
+    await api("/api/send", { method: "POST", body: { from: "np-z", to: "np-b", body: "hi b" } });
+    await new Promise((r) => setTimeout(r, 500));
+    for (const s of [other, off]) {
+      assert.equal(s.notifications.filter((n) => n.method === "notifications/claude/channel").length, 0);
+    }
+    assert.equal((await api("/api/inbox?agent=np-a")).length, 1, "left unread for piggyback / watch");
+  } finally {
+    other.stop();
+    off.stop();
+  }
 });

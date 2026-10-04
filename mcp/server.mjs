@@ -37,6 +37,9 @@ import {
   humanSize,
   health,
   defaultHost,
+  formatMessage,
+  formatMessages,
+  stopHookDecision,
 } from "./client.mjs";
 
 const SERVER_INFO = { name: "agent-intercom", version: "0.4.0" };
@@ -45,6 +48,10 @@ const CLI_PATH = fileURLToPath(new URL("./cli.mjs", import.meta.url));
 const MAX_WAIT_S = 86400; // office_wait / waitForReply upper bound
 const LEGACY_POLL_MS = 10000; // hubs without /api/inbox/wait are polled this often
 const PIGGYBACK_BUDGET = 4000; // max chars of unread mail appended to a tool result
+const STOP_HOOK_WAIT_S = 3500; // suggested office_wait timeout for the Stop hook
+// The name this server is registered under in the client's MCP config; hook
+// snippets must name it.
+const MCP_NAME = process.env.OFFICE_MCP_NAME || "agent-intercom";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -52,7 +59,8 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // periodic heartbeat, and remove it when the session/process ends. Only the
 // identity registered in this process is managed, so multiple sessions sharing a
 // config file never clobber each other's presence.
-let mine = null; // { url, token, agent }
+let mine = null; // { url, token, agent, waitOnStop }
+let client = { name: "" }; // clientInfo from initialize: tells Claude Code from Codex
 let beatTimer = null;
 function startPresence(url, tokenValue, agent) {
   mine = { url, token: tokenValue, agent };
@@ -96,6 +104,7 @@ async function leaveOffice() {
 // ---------------------------------------------------------------------------
 const pump = { key: null, cursor: 0, legacy: false };
 const waiters = new Set(); // { match(message), wakeOnly, resolve(messages|null) }
+const activeWaits = new Map(); // JSON-RPC request id -> cancel(), for notifications/cancelled
 const claimed = new Set(); // ids this process already put in front of the model
 
 const isWake = (m) => m.wake !== false;
@@ -157,7 +166,10 @@ function dispatch(messages) {
 
 // Resolve with matching messages (already unread, or the next to arrive), or
 // null after timeoutMs. With wakeOnly, FYI-only mail does not end the wait.
-function waitForMessages({ match, wakeOnly, timeoutMs, onProgress }) {
+// If the client gives up on the call (e.g. a hook timeout), it sends
+// notifications/cancelled; the wait then ends without claiming any mail, so a
+// message is never marked read for a caller that is no longer listening.
+function waitForMessages({ match, wakeOnly, timeoutMs, onProgress, requestId }) {
   ensurePump();
   return new Promise((resolve) => {
     let done = false;
@@ -168,12 +180,14 @@ function waitForMessages({ match, wakeOnly, timeoutMs, onProgress }) {
         if (done) return;
         done = true;
         waiters.delete(waiter);
+        if (requestId !== undefined) activeWaits.delete(requestId);
         clearTimeout(timer);
         clearInterval(ticker);
         resolve(messages);
       },
     };
     waiters.add(waiter);
+    if (requestId !== undefined) activeWaits.set(requestId, () => waiter.resolve(null));
     const timer = setTimeout(() => waiter.resolve(null), timeoutMs);
     const ticker = onProgress ? setInterval(onProgress, 30000) : null;
     // Registered first, checked second: mail that landed before this call (or that
@@ -189,14 +203,44 @@ function waitForMessages({ match, wakeOnly, timeoutMs, onProgress }) {
   });
 }
 
-function formatMessage(m) {
-  const tags = [`id ${m.id}`];
-  if (m.replyTo) tags.push(`reply to ${m.replyTo}`);
-  if (m.targetMode === "broadcast") tags.push("broadcast");
-  if (m.wake === false) tags.push("fyi");
-  return `[${new Date(m.createdAt).toISOString()}] ${m.from} -> ${m.to} (${tags.join(", ")})\n${m.body}`;
+// Add any other unread mail (e.g. FYIs that did not end the wait) so one wake-up
+// delivers everything that is waiting.
+async function withOtherUnread(messages) {
+  try {
+    const seen = new Set(messages.map((m) => m.id));
+    const others = unclaimed(await getInbox(mine.url, mine.token, mine.agent.id, true)).filter(
+      (m) => !seen.has(m.id)
+    );
+    handOver(others);
+    return [...messages, ...others].sort((a, b) => (a.seq || 0) - (b.seq || 0));
+  } catch {
+    return messages;
+  }
 }
-const formatMessages = (messages) => messages.map(formatMessage).join("\n\n");
+
+function stopHookConfig() {
+  return JSON.stringify(
+    {
+      hooks: {
+        Stop: [
+          {
+            hooks: [
+              {
+                type: "mcp_tool",
+                server: MCP_NAME,
+                tool: "office_wait",
+                input: { mode: "stop-hook", timeoutSec: STOP_HOOK_WAIT_S },
+                timeout: STOP_HOOK_WAIT_S + 100,
+              },
+            ],
+          },
+        ],
+      },
+    },
+    null,
+    2
+  );
+}
 
 function sentLine(message) {
   if (message.targetMode === "broadcast") {
@@ -286,6 +330,12 @@ const TOOLS = [
       type: "object",
       properties: {
         agentId: { type: "string", description: "Short unique id for this session, e.g. mac-tex-1" },
+        waitOnStop: {
+          type: "boolean",
+          description:
+            "Only if the agent-intercom Stop hook is installed: false stops this session from waiting for mail " +
+            "when its turn ends (use for the session the user types into). Default true",
+        },
         role: { type: "string", description: "Duty/positioning, e.g. leader, baseline, tex, reviewer" },
         host: { type: "string", description: "Machine label, e.g. macbook, linux-gpu" },
         url: { type: "string", description: "Hub base URL, e.g. http://211.159.223.182:3977 (default: saved)" },
@@ -333,12 +383,14 @@ const TOOLS = [
     name: "office_wait",
     description:
       "Block until a message arrives for this session (or timeoutSec passes) and return it. " +
-      "Use it when your next step depends on another session.",
+      "Use it when your next step depends on another session. mode=stop-hook is for the " +
+      "Stop hook only (returns hook JSON).",
     inputSchema: {
       type: "object",
       properties: {
         timeoutSec: { type: "number", description: "Give up after this many seconds (default 600)" },
         from: { type: "string", description: "Only wait for messages from this agent id" },
+        mode: { type: "string", enum: ["text", "stop-hook"], description: "Output format (default text)" },
       },
     },
   },
@@ -403,6 +455,20 @@ function mask(token) {
 }
 
 function deliveryNote(agent) {
+  if (/codex/i.test(client.name)) {
+    return (
+      "DELIVERY — Codex has no background wake-up, so: while you work, new mail is shown at the " +
+      "end of office_* tool results, and office_wait / office_send(waitForReply) block until mail " +
+      "arrives. To also be woken while idle, the USER can install this Stop hook in " +
+      "~/.codex/hooks.json (or <project>/.codex/hooks.json for worker projects only) and approve it " +
+      "in /hooks. Show it to them; do not edit their config yourself:\n" +
+      stopHookConfig() +
+      `\nand allow the long tool call in ~/.codex/config.toml:\n  [mcp_servers.${MCP_NAME}]\n` +
+      `  tool_timeout_sec = ${STOP_HOOK_WAIT_S + 200}\n` +
+      `With it, ending a turn waits up to ${Math.round(STOP_HOOK_WAIT_S / 60)} min for mail instead ` +
+      "of going idle. Register the session the user types into with waitOnStop=false."
+    );
+  }
   return (
     "NEXT — make sure you notice incoming messages. Run this as a BACKGROUND command; it " +
     "long-polls your inbox and exits (printing the message) the moment mail arrives, " +
@@ -413,7 +479,7 @@ function deliveryNote(agent) {
   );
 }
 
-async function callTool(name, args = {}, { progressToken } = {}) {
+async function callTool(name, args = {}, { progressToken, requestId } = {}) {
   const cfg = await loadConfig();
   // This process's registration wins over the shared config file, which only
   // remembers whichever session on this machine registered last.
@@ -449,6 +515,7 @@ async function callTool(name, args = {}, { progressToken } = {}) {
         },
       });
       startPresence(hubUrl, hubToken, agent); // keep online + auto-leave on exit
+      mine.waitOnStop = args.waitOnStop !== false;
       ensurePump();
       return toolText(
         `Registered "${agent.id}" with hub ${hubUrl}.\n` +
@@ -517,6 +584,7 @@ async function callTool(name, args = {}, { progressToken } = {}) {
           wakeOnly: false,
           timeoutMs: waitS * 1000,
           onProgress: progressPinger(progressToken, `waiting for a reply to ${message.id}`),
+          requestId,
         });
         out += replies
           ? `\n\nReply:\n\n${formatMessages(replies)}`
@@ -526,15 +594,25 @@ async function callTool(name, args = {}, { progressToken } = {}) {
     }
 
     case "office_wait": {
-      if (!mine) return toolText("This session is not registered here; call office_register first.", true);
-      const waitS = clampSeconds(args.timeoutSec, 600);
+      const stopHook = args.mode === "stop-hook";
+      if (stopHook) {
+        // A user-level hook fires in every session, registered or not: those that
+        // are not (or opted out) end their turn normally. Empty output = allow stop.
+        if (!mine || !mine.waitOnStop) return { ...toolText(""), raw: true };
+      } else if (!mine) {
+        return toolText("This session is not registered here; call office_register first.", true);
+      }
+      const waitS = clampSeconds(args.timeoutSec, stopHook ? STOP_HOOK_WAIT_S : 600);
       const from = args.from ? String(args.from) : "";
-      const messages = await waitForMessages({
+      const found = await waitForMessages({
         match: (m) => !from || m.from === from,
         wakeOnly: true,
         timeoutMs: waitS * 1000,
         onProgress: progressPinger(progressToken, "waiting for mail"),
+        requestId,
       });
+      const messages = found && (await withOtherUnread(found));
+      if (stopHook) return { ...toolText(messages ? stopHookDecision(mine.agent.id, messages) : ""), raw: true };
       return toolText(messages ? formatMessages(messages) : `No messages within ${waitS}s.`);
     }
 
@@ -612,6 +690,7 @@ async function handle(message) {
 
   try {
     if (method === "initialize") {
+      client = params?.clientInfo || client;
       return reply(id, {
         protocolVersion: params?.protocolVersion || DEFAULT_PROTOCOL,
         capabilities: { tools: {} },
@@ -624,9 +703,16 @@ async function handle(message) {
     if (method === "tools/call") {
       const result = await callTool(params?.name, params?.arguments || {}, {
         progressToken: params?._meta?.progressToken,
+        requestId: id,
       });
-      await appendUnread(result);
+      // Hook output must stay exactly what the hook expects.
+      if (result.raw) delete result.raw;
+      else await appendUnread(result);
       return reply(id, result);
+    }
+    if (method === "notifications/cancelled") {
+      activeWaits.get(params?.requestId)?.();
+      return;
     }
     if (method === "ping") {
       return reply(id, {});

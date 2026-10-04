@@ -68,26 +68,45 @@ function startMcp(name, extraEnv = {}) {
       }
     }
   });
-  const request = (method, params) =>
-    new Promise((resolve) => {
-      const id = nextId++;
-      pending.set(id, resolve);
-      child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
-    });
-  const call = async (tool, args = {}) => {
-    const res = await request("tools/call", { name: tool, arguments: args });
-    return res.result.content.map((c) => c.text).join("\n");
+  const send = (msg) => child.stdin.write(JSON.stringify({ jsonrpc: "2.0", ...msg }) + "\n");
+  const start = (method, params) => {
+    const id = nextId++;
+    const done = new Promise((resolve) => pending.set(id, resolve));
+    send({ id, method, params });
+    return { id, done };
+  };
+  const request = (method, params) => start(method, params).done;
+  const text = (res) => res.result.content.map((c) => c.text).join("\n");
+  const call = async (tool, args = {}) => text(await request("tools/call", { name: tool, arguments: args }));
+  const startCall = (tool, args = {}) => {
+    const { id, done } = start("tools/call", { name: tool, arguments: args });
+    return { id, done: done.then(text) };
   };
   return {
     child,
     notifications,
     request,
     call,
+    startCall,
+    notify: (method, params) => send({ method, params }),
     init: (clientName = "test-client") =>
       request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: clientName, version: "1" } }),
-    register: (agentId) => call("office_register", { agentId, role: "test", host: "ci", url: hubUrl, token: "" }),
+    register: (agentId, extra = {}) =>
+      call("office_register", { agentId, role: "test", host: "ci", url: hubUrl, token: "", ...extra }),
     stop: () => child.kill(),
   };
+}
+
+function runCli(args) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [path.join(root, "mcp/cli.mjs"), ...args], {
+      env: { ...process.env, OFFICE_URL: hubUrl, OFFICE_TOKEN: "", OFFICE_CONFIG: path.join(dir, "cli.json") },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    child.stdout.on("data", (c) => (out += c));
+    child.on("exit", (code) => resolve({ code, out }));
+  });
 }
 
 const until = async (predicate, ms = 3000) => {
@@ -218,4 +237,80 @@ test("a session never reads mail for the identity saved by another session", asy
     x.stop();
     y.stop();
   }
+});
+
+test("stop-hook wait blocks the stop with the mail, or allows it on timeout", async () => {
+  const a = startMcp("sh-a");
+  const b = startMcp("sh-b");
+  try {
+    await a.init();
+    await b.init("codex-mcp-client");
+    await a.register("sh-a");
+    const registered = await b.register("sh-b");
+    assert.match(registered, /hooks\.json/, "Codex gets the Stop hook setup note");
+
+    assert.equal(await b.call("office_wait", { mode: "stop-hook", timeoutSec: 1 }), "", "timeout allows the stop");
+
+    const waiting = b.call("office_wait", { mode: "stop-hook", timeoutSec: 10 });
+    await new Promise((r) => setTimeout(r, 300));
+    await a.call("office_send", { to: "sh-b", body: "fyi first", wake: false });
+    await a.call("office_send", { to: "sh-b", body: "run the eval" });
+    const decision = JSON.parse(await waiting);
+    assert.equal(decision.decision, "block");
+    assert.match(decision.reason, /run the eval/);
+    assert.match(decision.reason, /fyi first/, "pending FYIs ride along");
+  } finally {
+    a.stop();
+    b.stop();
+  }
+});
+
+test("stop-hook wait passes through for unregistered or opted-out sessions", async () => {
+  const x = startMcp("sh-x");
+  const y = startMcp("sh-y");
+  try {
+    await x.init();
+    await y.init();
+    const started = Date.now();
+    assert.equal(await x.call("office_wait", { mode: "stop-hook", timeoutSec: 30 }), "");
+    await y.register("sh-y", { waitOnStop: false });
+    assert.equal(await y.call("office_wait", { mode: "stop-hook", timeoutSec: 30 }), "");
+    assert.ok(Date.now() - started < 3000);
+  } finally {
+    x.stop();
+    y.stop();
+  }
+});
+
+test("a cancelled wait does not consume mail that arrives later", async () => {
+  const b = startMcp("cx-b");
+  try {
+    await b.init();
+    await b.register("cx-b");
+    const { id, done } = b.startCall("office_wait", { mode: "stop-hook", timeoutSec: 30 });
+    await new Promise((r) => setTimeout(r, 300));
+    b.notify("notifications/cancelled", { requestId: id, reason: "hook timeout" });
+    assert.equal(await done, "");
+    await api("/api/send", { method: "POST", body: { from: "cx-a", to: "cx-b", body: "still here?" } });
+    await new Promise((r) => setTimeout(r, 500));
+    const unread = await api("/api/inbox?agent=cx-b");
+    assert.deepEqual(unread.map((m) => m.body), ["still here?"]);
+  } finally {
+    b.stop();
+  }
+});
+
+test("CLI watch --stop-hook prints hook JSON on mail and nothing on timeout", async () => {
+  await api("/api/register", { method: "POST", body: { id: "cli-b" } });
+  const quiet = await runCli(["watch", "cli-b", "--stop-hook", "--timeout", "1"]);
+  assert.equal(quiet.code, 0);
+  assert.equal(quiet.out, "");
+  const watching = runCli(["watch", "cli-b", "--stop-hook", "--timeout", "10"]);
+  await new Promise((r) => setTimeout(r, 500));
+  await api("/api/send", { method: "POST", body: { from: "cli-a", to: "cli-b", body: "wake up" } });
+  const loud = await watching;
+  assert.equal(loud.code, 0);
+  const decision = JSON.parse(loud.out);
+  assert.equal(decision.decision, "block");
+  assert.match(decision.reason, /wake up/);
 });

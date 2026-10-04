@@ -11,6 +11,7 @@ import {
   uploadFile,
   downloadFile,
   humanSize,
+  stopHookDecision,
 } from "./client.mjs";
 
 function readOption(name, fallback = "") {
@@ -106,6 +107,7 @@ function usage() {
   node mcp/cli.mjs fetch <file-id> [save-path]
   node mcp/cli.mjs inbox <agent-id> [--all] [--mark-read]
   node mcp/cli.mjs watch [agent-id] [--once] [--interval 10]
+  node mcp/cli.mjs watch <agent-id> --stop-hook [--timeout 3500]
   node mcp/cli.mjs read <agent-id> [message-id...]
   node mcp/cli.mjs state
 
@@ -349,23 +351,31 @@ try {
     // a backgrounded command exiting re-invokes the agent. FYI (wake:false)
     // messages never end the watch on their own; they ride along with the next
     // wake-worthy one. Hubs without /api/inbox/wait are polled every --interval s.
+    //
+    // --stop-hook turns it into a command-type Stop hook: on mail it prints the
+    // hook's {"decision":"block","reason":...} JSON; after --timeout seconds
+    // without mail it prints nothing, which lets the turn end.
+    const rest = [...args];
+    const stopHook = takeFlag(rest, "stop-hook");
+    const once = takeFlag(rest, "once");
+    const deadline = Date.now() + (Number(takeOption(rest, "timeout")) || Infinity) * 1000;
     const cfg = await loadConfig();
-    const id = stripOptions(args)[0] || cfg.agent?.id;
+    const id = stripOptions(rest)[0] || cfg.agent?.id;
     if (!id) throw new Error("agent-id required (or register first so it is saved)");
     const url = process.env.OFFICE_URL || cfg.url || baseUrl;
     const token = process.env.OFFICE_TOKEN || cfg.token || "";
     const intervalMs = Math.max(2, Number(readOption("interval")) || 10) * 1000;
-    const once = args.includes("--once");
-    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const sleep = (ms) => new Promise((r) => setTimeout(r, Math.min(ms, Math.max(0, deadline - Date.now()))));
     let legacy = false;
     let messages = [];
-    for (;;) {
+    while (Date.now() < deadline) {
+      const leftS = Math.ceil((deadline - Date.now()) / 1000);
       try {
         if (once || legacy) {
           messages = await getInbox(url, token, id, true);
           if (!once && !messages.some((m) => m.wake !== false)) messages = [];
         } else {
-          messages = await waitInbox(url, token, id, { wakeOnly: true });
+          messages = await waitInbox(url, token, id, { wakeOnly: true, timeout: Math.min(50, leftS) });
         }
       } catch (error) {
         if (error.status === 404 && !legacy) {
@@ -380,7 +390,12 @@ try {
       if (messages.length || once) break;
       if (legacy) await sleep(intervalMs);
     }
-    if (!messages.length) {
+    if (stopHook) {
+      if (messages.length) {
+        await markRead(url, token, id, messages.map((m) => m.id)).catch(() => {});
+        console.log(stopHookDecision(id, messages));
+      }
+    } else if (!messages.length) {
       console.log(`No new messages for ${id}.`);
     } else {
       console.log(`\u{1F4EC} ${messages.length} new message(s) for ${id}:`);

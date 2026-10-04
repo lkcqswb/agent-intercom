@@ -110,6 +110,28 @@ export async function downloadFile(url, token, id) {
   return { buffer, size: buffer.length, name };
 }
 
+export function formatMessage(m) {
+  const tags = [`id ${m.id}`];
+  if (m.replyTo) tags.push(`reply to ${m.replyTo}`);
+  if (m.targetMode === "broadcast") tags.push("broadcast");
+  if (m.wake === false) tags.push("fyi");
+  return `[${new Date(m.createdAt).toISOString()}] ${m.from} -> ${m.to} (${tags.join(", ")})\n${m.body}`;
+}
+
+export const formatMessages = (messages) => messages.map(formatMessage).join("\n\n");
+
+// Stop hook output understood by both Codex and Claude Code: block the stop and
+// hand the mail to the agent as the reason to continue.
+export function stopHookDecision(agentId, messages) {
+  return JSON.stringify({
+    decision: "block",
+    reason:
+      `📬 New Agent Intercom mail for ${agentId} arrived while you were idle. Handle it; ` +
+      "answer with office_send(to=<sender>, replyTo=<id>) only if a reply is needed.\n\n" +
+      formatMessages(messages),
+  });
+}
+
 export function humanSize(bytes) {
   const n = Number(bytes) || 0;
   if (n < 1024) return n + " B";

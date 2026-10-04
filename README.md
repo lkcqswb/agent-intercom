@@ -87,17 +87,36 @@ Tell the tex session to rebuild.      → office_send
 Any messages for me?                  → office_inbox
 ```
 
+### How a session notices incoming messages
+
+The MCP server waits for mail itself (it long-polls the hub), so the model never
+spends turns running a monitor. How mail reaches the model depends on the client;
+`office_register`'s result tells the agent which case applies.
+
+| Client | Setup | Idle session is woken? |
+|---|---|---|
+| Claude Code | Start it with `claude --dangerously-load-development-channels server:agent-intercom` (channels are a research preview). Mail is pushed in as `<channel source="agent-intercom">` events. | yes, no monitor |
+| Codex | Install the Stop hook from [docs/delivery-design.md](docs/delivery-design.md#codex-stop-hook) in `~/.codex/hooks.json` and approve it in `/hooks`. Ending a turn then waits for mail instead of going idle. | yes |
+| Anything else / Claude Code without the flag | The agent runs `node mcp/cli.mjs watch <id>` in the background; it exits on mail and is re-launched. | yes, one extra turn per message |
+
+Everywhere, new mail is also appended to the next `office_*` tool result, and
+`office_send(waitForReply)` / `office_wait` block until mail arrives. Messages sent
+with `wake: false` are FYIs: they never wake anyone and arrive with the next mail.
+Design notes, cost model, and what is and isn't verified:
+[docs/delivery-design.md](docs/delivery-design.md).
+
 ### MCP tools
 
 | Tool | Purpose |
 |---|---|
-| `office_register` | Register this session (asks for host, role, url, token). |
+| `office_register` | Register this session (asks for host, role, url, token; reports the delivery mode). |
 | `office_status` | Show saved identity + hub health (token masked). |
 | `office_sessions` | List all registered sessions. |
-| `office_send` | Message an agent id, `dir:<folder>`, or `all`. |
+| `office_send` | Message an agent id, `dir:<folder>`, or `all`; optional `replyTo`, `wake: false` (FYI), `waitForReply`. |
+| `office_wait` | Block until mail arrives (or a timeout) and return it; `mode: "stop-hook"` for the Stop hook. |
 | `office_send_file` | Send a local file to another session (via the hub, ≤100 MB). |
 | `office_fetch` | Download a file another session sent you (by its fileId). |
-| `office_inbox` | Read this session's inbox (optionally mark read). |
+| `office_inbox` | Read this session's unread mail and mark it read. |
 | `office_unregister` | Remove a session from the hub. |
 
 ### Optional CLI
@@ -112,6 +131,7 @@ node ~/.agent-intercom/mcp/cli.mjs send leader linux-baseline-1 "Run baseline A.
 node ~/.agent-intercom/mcp/cli.mjs send-file leader linux-baseline-1 ./config.yaml "use this"
 node ~/.agent-intercom/mcp/cli.mjs fetch <file-id> ./saved.yaml
 node ~/.agent-intercom/mcp/cli.mjs inbox leader --mark-read
+node ~/.agent-intercom/mcp/cli.mjs watch leader            # exits when mail arrives
 ```
 
 ---
@@ -133,6 +153,11 @@ node ~/.agent-intercom/mcp/cli.mjs inbox leader --mark-read
 | `OFFICE_FILES_PATH` | hub | `<state dir>/files` | Where uploaded files are stored (Docker: `/data/files`). |
 | `OFFICE_FILE_TTL_MS` | hub | `86400000` | Delete uploaded files after this long (24h). |
 | `OFFICE_TRUST_PROXY` | hub | off | `1` to read client IP from `X-Forwarded-For`. |
+| `OFFICE_WAIT_MAX_S` | hub | `50` | Max seconds `GET /api/inbox/wait` holds a request. |
+| `OFFICE_PAIR_RATE` | hub | `30` | Max messages/min from one sender to one target (loop guard). |
+| `OFFICE_DUP_WINDOW_MS` | hub | `60000` | Reject an identical message to the same target within this window; `0` disables. |
+| `OFFICE_PUSH` | mcp | `auto` | Claude Code channel push: `auto` (when launched with the channel flag), `channel` (always), `off`. |
+| `OFFICE_MCP_NAME` | mcp | `agent-intercom` | Name the MCP server is registered under (for channel detection and hook snippets). |
 | `OFFICE_IDLE_MS` / `OFFICE_OFFLINE_MS` | hub | `45000` / `180000` | Mark agent idle / offline after inactivity. |
 | `OFFICE_AGENT_TTL_MS` | hub | `86400000` | Prune agents unseen this long (24h). |
 | `OFFICE_MESSAGE_TTL_MS` / `OFFICE_UNREAD_TTL_MS` | hub | `86400000` / `604800000` | Drop read msgs after 24h, unread after 7d. |
@@ -168,8 +193,11 @@ also accept the read-only `OFFICE_VIEW_TOKEN`; everything else needs the full to
 - `GET /api/state` — agents + recent events. **Does not include message bodies.**
 - `GET /api/feed?limit=N` — agents + recent message stream (powers the office UI).
 - `POST /api/register` · `POST /api/heartbeat` · `POST|DELETE /api/unregister`
-- `POST /api/send` — `{ from, to, body, file? }`; `to` may be an agent id, `dir:<query>`, or `all`.
-- `GET /api/inbox?agent=<id>[&unread=false]`
+- `POST /api/send` — `{ from, to, body, replyTo?, wake?, file? }`; `to` may be an agent id, `dir:<query>`, or `all`
+  (fanned out to every other agent, one copy each). `wake: false` marks an FYI. 429 from the loop guard.
+- `GET /api/inbox?agent=<id>[&unread=false][&after=<seq>]`
+- `GET /api/inbox/wait?agent=<id>[&after=<seq>][&timeout=<s>][&wake=1]` — long-poll: answers as soon as unread
+  mail newer than `after` arrives (with `wake=1`, once some of it is wake-worthy), or `[]` after the timeout.
 - `POST /api/read` — `{ agent, ids? }`
 - `POST /api/file?name=&from=&to=` — upload raw bytes (≤ `OFFICE_MAX_FILE`), returns `{ id, name, size }`.
 - `GET /api/file/<id>` — download the file (full token only, not the view token).
